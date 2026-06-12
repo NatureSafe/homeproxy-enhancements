@@ -142,15 +142,15 @@ jobs:
             exit 1
           fi
           umask 077
-          printf '%s\n' "${HOMEPROXY_APK_SIGN_KEY}" > homeproxy-custom.key
-          openssl pkey -in homeproxy-custom.key -pubout -out homeproxy-custom.pem
+          printf '%s\n' "${HOMEPROXY_APK_SIGN_KEY}" > "${{ github.workspace }}/homeproxy-custom.key"
+          openssl pkey -in "${{ github.workspace }}/homeproxy-custom.key" -pubout -out "${{ github.workspace }}/homeproxy-custom.pem"
           pushd .github
           CUSTOM_PKG_NAME="homeproxy-custom" \
             CUSTOM_PKG_DESCRIPTION="HomeProxy增强版" \
             fakeroot bash build-ipk.sh apk "${{ github.event_name }}"
           CUSTOM_PKG_NAME="homeproxy-custom" \
             CUSTOM_PKG_DESCRIPTION="HomeProxy增强版" \
-            APK_SIGN_KEY="../homeproxy-custom.key" \
+            APK_SIGN_KEY="${{ github.workspace }}/homeproxy-custom.key" \
             fakeroot bash build-ipk.sh ipk "${{ github.event_name }}"
           echo "APK_ASSET_NAME=$(ls *.apk)" >> $GITHUB_ENV
           echo "IPK_ASSET_NAME=$(ls *.ipk)" >> $GITHUB_ENV
@@ -166,7 +166,7 @@ jobs:
           cp .github/*.ipk repo/packages/${{ env.TARGET_ARCH }}/ 2>/dev/null || true
           cp .github/*.apk repo/packages/${{ env.TARGET_ARCH }}/ 2>/dev/null || true
 
-          cp homeproxy-custom.pem repo/apk-keys
+          cp "${{ github.workspace }}/homeproxy-custom.pem" repo/apk-keys
 
           pushd repo/packages/${{ env.TARGET_ARCH }}
           
@@ -180,8 +180,8 @@ jobs:
           # 生成 apk 索引
           if ls *.apk >/dev/null 2>&1; then
             echo "📦 Generating apk index..."
-            apk --keys-dir "repo/apk-keys" mkndx \
-              --sign-key homeproxy-custom.key \
+            apk --keys-dir "${{ github.workspace }}/repo/apk-keys" mkndx \
+              --sign-key "${{ github.workspace }}/homeproxy-custom.key" \
               --allow-untrusted \
               --description "HomeProxy for RK3566" \
               --arch ${{ env.TARGET_ARCH }} \
