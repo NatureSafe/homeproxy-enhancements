@@ -7,6 +7,9 @@ on:
 
 env:
   TARGET_ARCH: aarch64_cortex-a55
+  
+permissions:
+      contents: write
 
 jobs:
   build:
