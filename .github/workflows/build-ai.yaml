@@ -209,4 +209,4 @@ jobs:
           repo_token: ${{ github.token }}
           file: repo/**/*
           file_glob: true
-          tag: ${{ github.ref }}
+          tag: nightly_build
