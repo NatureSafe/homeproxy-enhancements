@@ -24,7 +24,7 @@ PKG_NAME="${CUSTOM_PKG_NAME:-$ORIGINAL_PKG_NAME}"
 if [ "$RELEASE_TYPE" == "release" ]; then
 	PKG_VERSION="$(get_mk_value "PKG_VERSION")"
 else
-	PKG_VERSION="99.$PKG_SOURCE_DATE_EPOCH-r0"
+	PKG_VERSION="nightly-build"
 fi
 
 PKG_DESCRIPTION="${CUSTOM_PKG_DESCRIPTION:-The modern ImmortalWrt proxy platform for ARM64/AMD64}"
