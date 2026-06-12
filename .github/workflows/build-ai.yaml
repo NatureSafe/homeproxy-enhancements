@@ -21,7 +21,7 @@ jobs:
 
       # ===== 缓存区 =====
       - name: Cache apk-tools
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-apk-tools
         with:
           path: |
@@ -30,14 +30,14 @@ jobs:
           key: apk-tools-${{ runner.os }}-rk3566-b5a31c0
 
       - name: Cache po2lmo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-po2lmo
         with:
           path: /usr/local/bin/po2lmo
           key: po2lmo-${{ runner.os }}-rk3566-v1
 
       - name: Cache ipkg-build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-ipkg-build
         with:
           path: |
