@@ -6,7 +6,7 @@ on:
     types: [published]
 
 env:
-  TARGET_ARCH: aarch64_cortex-a55
+  TARGET_ARCH: aarch64_cortex-a53
   
 permissions:
       contents: write
