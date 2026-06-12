@@ -213,3 +213,4 @@ jobs:
           file: repo/**/*
           file_glob: true
           tag: nightly_build
+          overwrite: true
