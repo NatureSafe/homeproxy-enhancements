@@ -1,0 +1,212 @@
+name: Build HomeProxy for RK3566
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+env:
+  TARGET_ARCH: aarch64_cortex-a55
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source tree
+        uses: actions/checkout@v6
+
+      # ===== 缓存区 =====
+      - name: Cache apk-tools
+        uses: actions/cache@v4
+        id: cache-apk-tools
+        with:
+          path: |
+            apk-tools/build
+            /usr/local/bin/apk
+          key: apk-tools-${{ runner.os }}-rk3566-b5a31c0
+
+      - name: Cache po2lmo
+        uses: actions/cache@v4
+        id: cache-po2lmo
+        with:
+          path: /usr/local/bin/po2lmo
+          key: po2lmo-${{ runner.os }}-rk3566-v1
+
+      - name: Cache ipkg-build
+        uses: actions/cache@v4
+        id: cache-ipkg-build
+        with:
+          path: |
+            /usr/local/bin/ipkg-build
+            /usr/local/bin/opkg-make-index
+            /usr/local/bin/opkg.py
+            /usr/local/bin/arfile.py
+          key: ipkg-build-${{ runner.os }}-v1
+
+      # ===== 依赖安装 =====
+      - name: Setup dependencies
+        run: |
+          sudo rm -rf /var/lib/man-db/auto-update
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            fakeroot \
+            libssl-dev \
+            lua5.1 \
+            meson \
+            ninja-build
+
+      # ===== 构建 apk-tools =====
+      - name: Checkout apk-tools
+        if: steps.cache-apk-tools.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: alpinelinux/apk-tools
+          path: apk-tools
+          fetch-depth: 0
+          ref: b5a31c0d865342ad80be10d68f1bb3d3ad9b0866
+
+      - name: Build apk-tools
+        if: steps.cache-apk-tools.outputs.cache-hit != 'true'
+        run: |
+          pushd apk-tools
+          meson setup build \
+            -Db_lto=true \
+            -Dcompressed-help=false \
+            -Ddocs=disabled \
+            -Dhelp=enabled \
+            -Dlua_version=5.1 \
+            -Ddefault_library=static \
+            -Durl_backend=wget \
+            -Dzstd=false \
+            -Dpython=disabled \
+            -Dtests=disabled \
+            -Dcrypto_backend=openssl
+          ninja -C build
+          sudo meson install -C build --strip
+          popd
+
+      # ===== 构建 po2lmo =====
+      - name: Checkout po2lmo
+        if: steps.cache-po2lmo.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: openwrt/luci
+          path: po2lmo
+          sparse-checkout: modules/luci-base/src
+
+      - name: Build po2lmo
+        if: steps.cache-po2lmo.outputs.cache-hit != 'true'
+        run: |
+          pushd po2lmo/modules/luci-base/src
+          make po2lmo
+          sudo install -m0755 -s po2lmo /usr/local/bin/po2lmo
+          popd
+
+      # ===== 获取 ipkg-build =====
+      - name: Fetch ipkg-build
+        if: steps.cache-ipkg-build.outputs.cache-hit != 'true'
+        run: |
+          curl -fLO "https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build"
+          sudo install -m0755 ipkg-build /usr/local/bin/ipkg-build
+          # 下载 opkg-make-index 及其必要依赖 opkg.py
+          # 注意：这两个文件必须在同一个目录下，否则 opkg-make-index 无法运行
+          curl -fLO "https://git.yoctoproject.org/opkg-utils/plain/opkg-make-index"
+          curl -fLO "https://git.yoctoproject.org/opkg-utils/plain/opkg.py"
+          curl -fLO "https://git.yoctoproject.org/opkg-utils/plain/arfile.py"
+          
+          # 将它们安装到 /usr/local/bin，确保可以直接调用
+          sudo install -m0755 opkg-make-index /usr/local/bin/opkg-make-index
+          sudo install -m0644 opkg.py /usr/local/bin/opkg.py
+          sudo install -m0644 arfile.py /usr/local/bin/arfile.py
+      
+
+      # ===== 修补 build-ipk.sh 为 RK3566 =====
+      - name: Patch build-ipk.sh for RK3566
+        run: |
+          sed -i 's/arch:all/arch:${{ env.TARGET_ARCH }}/g' .github/build-ipk.sh
+          sed -i 's/Architecture: all/Architecture: ${{ env.TARGET_ARCH }}/g' .github/build-ipk.sh
+          sed -i 's/_all\.ipk/_${{ env.TARGET_ARCH }}.ipk/g' .github/build-ipk.sh
+          sed -i 's/_all\.apk/_${{ env.TARGET_ARCH }}.apk/g' .github/build-ipk.sh
+
+      # ===== 构建包 =====
+      - name: Build packages
+        env:
+          HOMEPROXY_APK_SIGN_KEY: ${{ secrets.HOMEPROXY_APK_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEPROXY_APK_SIGN_KEY}" ]; then
+            echo "HOMEPROXY_APK_SIGN_KEY secret is required" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${HOMEPROXY_APK_SIGN_KEY}" > homeproxy-custom.key
+          openssl pkey -in homeproxy-custom.key -pubout -out homeproxy-custom.pem
+          pushd .github
+          CUSTOM_PKG_NAME="homeproxy-custom" \
+            CUSTOM_PKG_DESCRIPTION="HomeProxy增强版" \
+            fakeroot bash build-ipk.sh apk "${{ github.event_name }}"
+          CUSTOM_PKG_NAME="homeproxy-custom" \
+            CUSTOM_PKG_DESCRIPTION="HomeProxy增强版" \
+            APK_SIGN_KEY="../homeproxy-custom.key" \
+            fakeroot bash build-ipk.sh ipk "${{ github.event_name }}"
+          echo "APK_ASSET_NAME=$(ls *.apk)" >> $GITHUB_ENV
+          echo "IPK_ASSET_NAME=$(ls *.ipk)" >> $GITHUB_ENV
+          popd
+
+      # ===== 生成仓库索引 =====
+      - name: Generate repository index
+        run: |
+          set -euo pipefail
+          mkdir -p repo/packages/${{ env.TARGET_ARCH }}
+          mkdir -p repo/apk-keys
+
+          cp .github/*.ipk repo/packages/${{ env.TARGET_ARCH }}/ 2>/dev/null || true
+          cp .github/*.apk repo/packages/${{ env.TARGET_ARCH }}/ 2>/dev/null || true
+
+          cp homeproxy-custom.pem repo/apk-keys
+
+          pushd repo/packages/${{ env.TARGET_ARCH }}
+          
+          # 生成 opkg 索引
+          if ls *.ipk >/dev/null 2>&1; then
+            echo "📦 Generating opkg index..."
+            opkg-make-index . > Packages
+            gzip -kc Packages > Packages.gz
+          fi
+          
+          # 生成 apk 索引
+          if ls *.apk >/dev/null 2>&1; then
+            echo "📦 Generating apk index..."
+            apk --keys-dir "repo/apk-keys" mkndx \
+              --sign-key homeproxy-custom.key \
+              --allow-untrusted \
+              --description "HomeProxy for RK3566" \
+              --arch ${{ env.TARGET_ARCH }} \
+              --output packages.adb \
+              *.apk
+          fi
+          
+          popd
+
+          echo "✅ Repository structure:"
+          find repo -type f | sort
+
+      # ===== 发布 =====
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: github.event_name != 'release'
+        with:
+          name: homeproxy-rk3566-repo
+          path: repo
+          retention-days: 30
+
+      - name: Publish to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ github.token }}
+          file: repo/**/*
+          file_glob: true
+          tag: ${{ github.ref }}
