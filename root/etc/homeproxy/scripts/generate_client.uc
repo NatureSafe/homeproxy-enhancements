@@ -17,6 +17,44 @@ import {
 	removeBlankAttrs, validation, HP_DIR, RUN_DIR
 } from 'homeproxy';
 
+// Configuration error collection
+let config_errors = [];
+
+function reportError(type, message, suggestion) {
+	push(config_errors, {
+		type: type,           // 'error', 'warning'
+		message: message,
+		suggestion: suggestion
+	});
+}
+
+function hasErrors() {
+	for (let err in config_errors)
+		if (err.type === 'error')
+			return true;
+	return false;
+}
+
+/* Merge source object's keys into target (ucode has no Object.assign) */
+function mergeObject(target, source) {
+	if (type(source) !== 'object')
+		return target;
+	for (let k in source)
+		target[k] = source[k];
+	return target;
+}
+
+function formatErrors() {
+	let output = '';
+	for (let err in config_errors) {
+		output += sprintf('[%s] %s\n', uc(err.type), err.message);
+		if (err.suggestion)
+			output += sprintf('建议: %s\n', err.suggestion);
+		output += '\n';
+	}
+	return output;
+}
+
 const ubus = connect();
 
 /* const features = ubus.call('luci.homeproxy', 'singbox_get_features') || {}; */
@@ -43,6 +81,7 @@ const ucinode = 'node';
 const uciruleset = 'ruleset';
 
 const routing_mode = uci.get(uciconfig, ucimain, 'routing_mode') || 'bypass_mainland_china';
+const routing_target_max_depth = 20;
 
 let wan_dns = ubus.call('network.interface', 'status', {'interface': 'wan'})?.['dns-server']?.[0];
 if (!wan_dns)
@@ -121,10 +160,10 @@ if (match(proxy_mode, /redirect/)) {
 	self_mark = uci.get(uciconfig, 'infra', 'self_mark') || '100';
 	redirect_port = uci.get(uciconfig, 'infra', 'redirect_port') || '5331';
 }
-if (match(proxy_mode), /tproxy/)
+if (match(proxy_mode, /tproxy/))
 	if (main_udp_node !== 'nil' || routing_mode === 'custom')
 		tproxy_port = uci.get(uciconfig, 'infra', 'tproxy_port') || '5332';
-if (match(proxy_mode), /tun/) {
+if (match(proxy_mode, /tun/)) {
 	tun_name = uci.get(uciconfig, uciinfra, 'tun_name') || 'singtun0';
 	tun_addr4 = uci.get(uciconfig, uciinfra, 'tun_addr4') || '172.19.0.1/30';
 	tun_addr6 = uci.get(uciconfig, uciinfra, 'tun_addr6') || 'fdfe:dcba:9876::1/126';
@@ -139,7 +178,7 @@ if (match(proxy_mode), /tun/) {
 const log_level = uci.get(uciconfig, ucimain, 'log_level') || 'warn';
 
 const clash_api_enabled = uci.get(uciconfig, ucimain, 'clash_api_enabled') || '0',
-      clash_api_external_controller = uci.get(uciconfig, ucimain, 'clash_api_external_controller') || '192.168.9.1:9090',
+      clash_api_external_controller = uci.get(uciconfig, ucimain, 'clash_api_external_controller') || '127.0.0.1:9090',
       clash_api_secret = uci.get(uciconfig, ucimain, 'clash_api_secret'),
       clash_api_default_mode = uci.get(uciconfig, ucimain, 'clash_api_default_mode') || 'Rule',
       clash_api_allow_origin = uci.get(uciconfig, ucimain, 'clash_api_allow_origin') || [],
@@ -220,33 +259,9 @@ function generate_endpoint(node) {
 	return endpoint;
 }
 
-function generate_outbound(node) {
-	if (type(node) !== 'object' || isEmpty(node))
-		return null;
-
-	const outbound = {
-		type: node.type,
-		tag: 'cfg-' + node['.name'] + '-out',
-		routing_mark: strToInt(self_mark),
-
-		server: node.address,
-		server_port: strToInt(node.port),
-		/* Hysteria(2) */
+function generate_hysteria_options(node) {
+	return {
 		server_ports: node.hysteria_hopping_port,
-
-		username: (node.type !== 'ssh') ? node.username : null,
-		user: (node.type === 'ssh') ? node.username : null,
-		password: node.password,
-
-		/* Direct */
-		override_address: node.override_address,
-		override_port: strToInt(node.override_port),
-		proxy_protocol: strToInt(node.proxy_protocol),
-		/* AnyTLS */
-		idle_session_check_interval: strToTime(node.anytls_idle_session_check_interval),
-		idle_session_timeout: strToTime(node.anytls_idle_session_timeout),
-		min_idle_session: strToInt(node.anytls_min_idle_session),
-		/* Hysteria (2) */
 		hop_interval: strToTime(node.hysteria_hop_interval),
 		up_mbps: strToInt(node.hysteria_up_mbps),
 		down_mbps: strToInt(node.hysteria_down_mbps),
@@ -258,34 +273,114 @@ function generate_outbound(node) {
 		auth_str: (node.hysteria_auth_type === 'string') ? node.hysteria_auth_payload : null,
 		recv_window_conn: strToInt(node.hysteria_recv_window_conn),
 		recv_window: strToInt(node.hysteria_revc_window),
-		disable_mtu_discovery: strToBool(node.hysteria_disable_mtu_discovery),
-		/* Shadowsocks */
+		disable_mtu_discovery: strToBool(node.hysteria_disable_mtu_discovery)
+	};
+}
+
+function generate_shadowsocks_options(node) {
+	return {
 		method: node.shadowsocks_encrypt_method,
 		plugin: node.shadowsocks_plugin,
-		plugin_opts: node.shadowsocks_plugin_opts,
-		/* ShadowTLS / Socks */
+		plugin_opts: node.shadowsocks_plugin_opts
+	};
+}
+
+function generate_tls_options(node) {
+	if (node.tls !== '1')
+		return null;
+
+	return {
+		enabled: true,
+		server_name: node.tls_sni,
+		insecure: strToBool(node.tls_insecure),
+		alpn: node.tls_alpn,
+		min_version: node.tls_min_version,
+		max_version: node.tls_max_version,
+		cipher_suites: node.tls_cipher_suites,
+		certificate_path: node.tls_cert_path,
+		ech: (node.tls_ech === '1') ? {
+			enabled: true,
+			config: node.tls_ech_config,
+			config_path: node.tls_ech_config_path
+		} : null,
+		utls: !isEmpty(node.tls_utls) ? {
+			enabled: true,
+			fingerprint: node.tls_utls
+		} : null,
+		reality: (node.tls_reality === '1') ? {
+			enabled: true,
+			public_key: node.tls_reality_public_key,
+			short_id: node.tls_reality_short_id
+		} : null
+	};
+}
+
+function generate_transport_options(node) {
+	if (isEmpty(node.transport))
+		return null;
+
+	return {
+		type: node.transport,
+		host: node.http_host || node.httpupgrade_host,
+		path: node.http_path || node.ws_path,
+		headers: node.ws_host ? { Host: node.ws_host } : null,
+		method: node.http_method,
+		max_early_data: strToInt(node.websocket_early_data),
+		early_data_header_name: node.websocket_early_data_header,
+		service_name: node.grpc_servicename,
+		idle_timeout: strToTime(node.http_idle_timeout),
+		ping_timeout: strToTime(node.http_ping_timeout),
+		permit_without_stream: strToBool(node.grpc_permit_without_stream)
+	};
+}
+
+function generate_outbound(node) {
+	if (type(node) !== 'object' || isEmpty(node))
+		return null;
+
+	const outbound = {
+		type: node.type,
+		tag: 'cfg-' + node['.name'] + '-out',
+		routing_mark: strToInt(self_mark),
+		server: node.address,
+		server_port: strToInt(node.port),
+		username: (node.type !== 'ssh') ? node.username : null,
+		user: (node.type === 'ssh') ? node.username : null,
+		password: node.password
+	};
+
+	// Protocol-specific options
+	if (node.type in ['hysteria', 'hysteria2'])
+		mergeObject(outbound, generate_hysteria_options(node));
+	else if (node.type === 'shadowsocks')
+		mergeObject(outbound, generate_shadowsocks_options(node));
+
+	// Common options
+	mergeObject(outbound, {
+		override_address: node.override_address,
+		override_port: strToInt(node.override_port),
+		proxy_protocol: strToInt(node.proxy_protocol),
+		idle_session_check_interval: strToTime(node.anytls_idle_session_check_interval),
+		idle_session_timeout: strToTime(node.anytls_idle_session_timeout),
+		min_idle_session: strToInt(node.anytls_min_idle_session),
 		version: (node.type === 'shadowtls') ? strToInt(node.shadowtls_version) : ((node.type === 'socks') ? node.socks_version : null),
-		/* SSH */
 		client_version: node.ssh_client_version,
 		host_key: node.ssh_host_key,
 		host_key_algorithms: node.ssh_host_key_algo,
 		private_key: node.ssh_priv_key,
 		private_key_passphrase: node.ssh_priv_key_pp,
-		/* Tuic */
 		uuid: node.uuid,
 		congestion_control: node.tuic_congestion_control,
 		udp_relay_mode: node.tuic_udp_relay_mode,
 		udp_over_stream: strToBool(node.tuic_udp_over_stream),
 		zero_rtt_handshake: strToBool(node.tuic_enable_zero_rtt),
 		heartbeat: strToTime(node.tuic_heartbeat),
-		/* VLESS / VMess */
 		flow: node.vless_flow,
 		alter_id: strToInt(node.vmess_alterid),
 		security: node.vmess_encrypt,
 		global_padding: strToBool(node.vmess_global_padding),
 		authenticated_length: strToBool(node.vmess_authenticated_length),
 		packet_encoding: node.packet_encoding,
-
 		multiplex: (node.multiplex === '1') ? {
 			enabled: true,
 			protocol: node.multiplex_protocol,
@@ -299,45 +394,8 @@ function generate_outbound(node) {
 				down_mbps: strToInt(node.multiplex_brutal_down)
 			} : null
 		} : null,
-		tls: (node.tls === '1') ? {
-			enabled: true,
-			server_name: node.tls_sni,
-			insecure: strToBool(node.tls_insecure),
-			alpn: node.tls_alpn,
-			min_version: node.tls_min_version,
-			max_version: node.tls_max_version,
-			cipher_suites: node.tls_cipher_suites,
-			certificate_path: node.tls_cert_path,
-			ech: (node.tls_ech === '1') ? {
-				enabled: true,
-				config: node.tls_ech_config,
-				config_path: node.tls_ech_config_path
-			} : null,
-			utls: !isEmpty(node.tls_utls) ? {
-				enabled: true,
-				fingerprint: node.tls_utls
-			} : null,
-			reality: (node.tls_reality === '1') ? {
-				enabled: true,
-				public_key: node.tls_reality_public_key,
-				short_id: node.tls_reality_short_id
-			} : null
-		} : null,
-		transport: !isEmpty(node.transport) ? {
-			type: node.transport,
-			host: node.http_host || node.httpupgrade_host,
-			path: node.http_path || node.ws_path,
-			headers: node.ws_host ? {
-				Host: node.ws_host
-			} : null,
-			method: node.http_method,
-			max_early_data: strToInt(node.websocket_early_data),
-			early_data_header_name: node.websocket_early_data_header,
-			service_name: node.grpc_servicename,
-			idle_timeout: strToTime(node.http_idle_timeout),
-			ping_timeout: strToTime(node.http_ping_timeout),
-			permit_without_stream: strToBool(node.grpc_permit_without_stream)
-		} : null,
+		tls: generate_tls_options(node),
+		transport: generate_transport_options(node),
 		udp_over_tcp: (node.udp_over_tcp === '1') ? {
 			enabled: true,
 			version: strToInt(node.udp_over_tcp_version)
@@ -345,7 +403,7 @@ function generate_outbound(node) {
 		tcp_fast_open: strToBool(node.tcp_fast_open),
 		tcp_multi_path: strToBool(node.tcp_multi_path),
 		udp_fragment: strToBool(node.udp_fragment)
-	};
+	});
 
 	return outbound;
 }
@@ -441,7 +499,7 @@ function get_routing_target_outbound(target) {
 	return 'cfg-' + routing_node + '-out';
 }
 
-function push_routing_target_outbound(client_config, target, routing_nodes) {
+function push_routing_target_outbound(client_config, target, routing_nodes, seen_path) {
 	const match_target = match(target || '', /^cfg-(.+)-out$/);
 	if (match_target)
 		target = match_target[1];
@@ -451,6 +509,25 @@ function push_routing_target_outbound(client_config, target, routing_nodes) {
 	else if (is_builtin_outbound(target))
 		return;
 
+	if (!seen_path)
+		seen_path = [];
+	if (~index(seen_path, target)) {
+		reportError('error',
+			sprintf('路由节点配置错误：检测到循环引用\n循环路径: %s',
+				join(' -> ', [ ...seen_path, target ])),
+			'进入 LuCI 界面 -> 服务 -> HomeProxy -> 路由节点，检查以下节点的"出站"配置，移除循环引用');
+		return null;
+	}
+
+	if (length(seen_path) >= routing_target_max_depth) {
+		reportError('error',
+			sprintf('路由节点配置错误：嵌套层级过深\n当前路径: %s\n最大允许层级: %d',
+				join(' -> ', [ ...seen_path, target ]),
+				routing_target_max_depth),
+			'简化路由节点的嵌套结构，避免过多的 Selector 嵌套');
+		return null;
+	}
+
 	const routing_node = uci.get(uciconfig, target, 'node');
 	if (isEmpty(routing_node)) {
 		if (is_node_section(target)) {
@@ -459,7 +536,7 @@ function push_routing_target_outbound(client_config, target, routing_nodes) {
 			push(routing_nodes, target);
 		}
 	} else if (!(routing_node in ['urltest', 'selector'])) {
-		push_routing_target_outbound(client_config, routing_node, routing_nodes);
+		push_routing_target_outbound(client_config, routing_node, routing_nodes, [ ...seen_path, target ]);
 	} else {
 		return;
 	}
@@ -1078,6 +1155,17 @@ if (strToBool(clash_api_enabled))
 if (isEmpty(config.experimental))
 	config.experimental = null;
 /* Experimental end */
+
+// Check for configuration errors. Fatal errors (e.g. routing cycles) must NOT
+// overwrite the existing sing-box-c.json with an invalid config: that would make
+// `sing-box check` in the init script fail and take the running proxy down.
+// Instead, report the aggregated errors and exit non-zero, leaving the last
+// known-good config in place for the init script to keep using.
+if (hasErrors()) {
+	warn('HomeProxy 配置验证发现以下问题:\n\n' + formatErrors());
+	warn('为避免用无效配置覆盖当前可用配置，本次未写入新配置；服务将继续使用上次的有效配置。请修复上述问题后重启服务。\n');
+	exit(1);
+}
 
 system('mkdir -p ' + RUN_DIR);
 writefile(RUN_DIR + '/sing-box-c.json', sprintf('%.J\n', removeBlankAttrs(config)));

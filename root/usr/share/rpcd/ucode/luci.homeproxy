@@ -8,6 +8,7 @@
 'use strict';
 
 import { access, error, lstat, popen, readfile, stat, writefile } from 'fs';
+import { cursor } from 'uci';
 
 /* Kanged from ucode/luci */
 function shellquote(s) {
@@ -20,10 +21,6 @@ function hasKernelModule(kmod) {
 
 const HP_DIR = '/etc/homeproxy';
 const RUN_DIR = '/var/run/homeproxy';
-const BACKUP_ARCHIVE = '/tmp/homeproxy-backup.tar.gz';
-const RESTORE_ARCHIVE = '/tmp/homeproxy-restore.tar.gz';
-const ROLLBACK_ARCHIVE = '/tmp/homeproxy-rollback.tar.gz';
-const BACKUP_LIST = '/tmp/homeproxy-backup.list';
 
 function commandOutput(command) {
 	const fd = popen(`${command} 2>&1`);
@@ -37,6 +34,218 @@ function commandOutput(command) {
 	}
 
 	return out;
+}
+
+// Generate random suffix for temporary files
+function generateTempSuffix() {
+	let suffix = trim(commandOutput("hexdump -n 8 -e '1/1 \"%02x\"' /dev/urandom 2>/dev/null"));
+
+	if (!match(suffix, /^[a-f0-9]{16}$/))
+		suffix = replace(trim(commandOutput('date +%s 2>/dev/null')), /[^a-f0-9]/g, '');
+
+	return suffix;
+}
+
+// Create private random work directory for backup/restore operations.
+// Mode 700 so the certificates/private keys staged here are never readable by
+// other local users while the archive is being built or verified.
+function createWorkDir() {
+	const work_dir = '/tmp/homeproxy-work-' + generateTempSuffix();
+	system(`mkdir -p ${shellquote(work_dir)} && chmod 700 ${shellquote(work_dir)}`);
+	return work_dir;
+}
+
+// Session-scoped temporary file paths
+let BACKUP_ARCHIVE = '/tmp/homeproxy-backup-' + generateTempSuffix() + '.tar.gz';
+let RESTORE_ARCHIVE = null;  // Set when file is uploaded
+let ROLLBACK_ARCHIVE = null;  // Set when rollback is created
+
+function isEmpty(value) {
+	return !value || value === 'nil' || (type(value) in ['array', 'object'] && length(value) === 0);
+}
+
+function firstValue(value) {
+	return (type(value) === 'array') ? value[0] : value;
+}
+
+function stripCidr(value) {
+	return replace(trim(firstValue(value) || ''), /\/.*$/, '');
+}
+
+function isIPv4Address(value) {
+	return !!match(value || '', /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/);
+}
+
+function isPortableBindHost(value) {
+	value = lc(trim(value || ''));
+
+	return value === 'localhost' ||
+		value === '0.0.0.0' ||
+		value === '::' ||
+		value === '[::]' ||
+		value === '::1' ||
+		value === '[::1]' ||
+		!!match(value, /^127\./);
+}
+
+function appendIPv4Address(addresses, value) {
+	value = stripCidr(value);
+
+	if (isIPv4Address(value) && index(addresses, value) === -1)
+		push(addresses, value);
+}
+
+function localIPv4Addresses() {
+	const netuci = cursor();
+	let addresses = [];
+
+	netuci.load('network');
+
+	let lan_ipaddr = netuci.get('network', 'lan', 'ipaddr');
+	if (type(lan_ipaddr) === 'array') {
+		for (let addr in lan_ipaddr)
+			appendIPv4Address(addresses, addr);
+	} else {
+		appendIPv4Address(addresses, lan_ipaddr);
+	}
+
+	for (let line in split(commandOutput('/sbin/ip -4 -o addr show scope global'), /\n/)) {
+		let matched = match(line, /[ \t]inet[ \t]+([0-9.]+)(\/[0-9]+)?[ \t]/);
+		if (matched)
+			appendIPv4Address(addresses, matched[1]);
+	}
+
+	return addresses;
+}
+
+function parseController(value, default_port) {
+	value = trim(replace(firstValue(value) || '', /^https?:\/\//, ''));
+	value = replace(value, /\/.*$/, '');
+
+	let matched = match(value, /^\[([^\]]+)\](:([0-9]+))?$/);
+	if (matched)
+		return { host: matched[1], port: int(matched[3] || default_port) };
+
+	matched = match(value, /^([^:]+):([0-9]+)$/);
+	if (matched)
+		return { host: matched[1], port: int(matched[2]) };
+
+	return { host: value, port: int(default_port) };
+}
+
+function formatController(host, port) {
+	return sprintf((index(host, ':') >= 0) ? '[%s]:%d' : '%s:%d', host, port);
+}
+
+function normalizeLocalControllerOption(uci, local_addresses, fallback_host, option, default_port, set_when_empty) {
+	let value = uci.get('homeproxy', 'config', option);
+
+	if (isEmpty(value)) {
+		if (!set_when_empty)
+			return null;
+
+		let next = formatController(fallback_host, default_port);
+		uci.set('homeproxy', 'config', option, next);
+		return next;
+	}
+
+	let controller = parseController(value, default_port),
+	    host = controller.host;
+
+	if (isEmpty(host))
+		host = fallback_host;
+	else if (isPortableBindHost(host))
+		return null;
+	else if (!isIPv4Address(host) || index(local_addresses, host) !== -1)
+		return null;
+
+	let next = formatController(fallback_host, controller.port || default_port);
+	uci.set('homeproxy', 'config', option, next);
+	return next;
+}
+
+function normalizeRestoredLocalControllers() {
+	let local_addresses = localIPv4Addresses();
+	let fallback_host = local_addresses[0];
+
+	if (isEmpty(fallback_host))
+		return {};
+
+	const hpuci = cursor();
+	let adjustments = {};
+
+	hpuci.load('homeproxy');
+
+	for (let item in [
+		[ 'clash_api_external_controller', 9090, true ],
+		[ 'clash_api_proxy_external_controller', 9091, false ]
+	]) {
+		let next = normalizeLocalControllerOption(hpuci, local_addresses, fallback_host, item[0], item[1], item[2]);
+
+		if (next)
+			adjustments[item[0]] = next;
+	}
+
+	if (length(keys(adjustments)))
+		hpuci.commit('homeproxy');
+
+	return adjustments;
+}
+
+function restoredServiceExpectations() {
+	const hpuci = cursor();
+	hpuci.load('homeproxy');
+
+	const routing_mode = hpuci.get('homeproxy', 'config', 'routing_mode') || 'bypass_mainland_china',
+	      outbound_node = (routing_mode === 'custom')
+		? (hpuci.get('homeproxy', 'routing', 'default_outbound') || 'nil')
+		: (hpuci.get('homeproxy', 'config', 'main_node') || 'nil'),
+	      server_enabled = hpuci.get('homeproxy', 'server', 'enabled') || '0';
+
+	return {
+		client: !isEmpty(outbound_node),
+		server: server_enabled === '1'
+	};
+}
+
+function checkSingBoxRuntimeConfig(path, label) {
+	const config = stat(path);
+
+	if (!config || config.type !== 'file' || config.size <= 0)
+		return `${label}运行配置未生成`;
+
+	if (system(`/usr/bin/sing-box check --config ${shellquote(path)} >/dev/null 2>&1`) !== 0)
+		return `${label}运行配置校验失败`;
+
+	return null;
+}
+
+function validateRestoredService() {
+	const expected = restoredServiceExpectations();
+
+	if (expected.client) {
+		let error = checkSingBoxRuntimeConfig(`${RUN_DIR}/sing-box-c.json`, '客户端');
+		if (error)
+			return { result: false, error };
+	}
+
+	if (expected.server) {
+		let error = checkSingBoxRuntimeConfig(`${RUN_DIR}/sing-box-s.json`, '服务端');
+		if (error)
+			return { result: false, error };
+	}
+
+	if (expected.client || expected.server) {
+		const status = commandOutput('/etc/init.d/homeproxy status');
+
+		if (match(status, /active with no instances/))
+			return { result: false, error: 'HomeProxy 服务未启动任何实例' };
+
+		if (system('/etc/init.d/homeproxy status >/dev/null 2>&1') !== 0)
+			return { result: false, error: 'HomeProxy 服务状态异常' };
+	}
+
+	return { result: true };
 }
 
 function archiveMemberPath(line) {
@@ -88,6 +297,10 @@ function validateBackupArchive(path) {
 			continue;
 		}
 
+		// Skip manifest itself (used for integrity check, not restored)
+		if (path === 'homeproxy-backup-manifest.json')
+			continue;
+
 		if (!allowedBackupPath(path))
 			errors = [ ...errors, `备份文件内包含不支持的路径: ${path}` ];
 		else
@@ -127,14 +340,80 @@ function createBackupArchive(path) {
 	if (!length(files))
 		return { result: false, error: '没有可备份的 HomeProxy 文件' };
 
-	writefile(BACKUP_LIST, join('\n', files) + '\n');
-	system(`rm -f ${shellquote(path)}`);
+	// Create private work directory
+	const work_dir = createWorkDir();
+	const staging_root = `${work_dir}/staging`;
+	system(`mkdir -p ${shellquote(staging_root)}`);
 
-	let exit_code = system(`cd / && /bin/tar -czf ${shellquote(path)} -T ${shellquote(BACKUP_LIST)}`);
-	system(`rm -f ${shellquote(BACKUP_LIST)}`);
+	// Copy files to staging root (preserve directory structure)
+	for (let file in files) {
+		let src = '/' + file;
+		let dst = `${staging_root}/${file}`;
+		let dst_dir = match(dst, /^(.*)\/[^\/]+$/);
 
-	if (exit_code !== 0)
+		if (dst_dir && dst_dir[1]) {
+			system(`mkdir -p ${shellquote(dst_dir[1])}`);
+		}
+
+		let exit_code = system(`cp ${shellquote(src)} ${shellquote(dst)}`);
+		if (exit_code !== 0) {
+			system(`rm -rf ${shellquote(work_dir)}`);
+			return { result: false, error: `复制文件失败: ${file}` };
+		}
+	}
+
+	// Generate SHA-256 manifest from staging files
+	let manifest = {};
+	for (let file in files) {
+		let fullpath = `${staging_root}/${file}`;
+		let filestat = stat(fullpath);
+		if (filestat?.type === 'file') {
+			let hash = trim(commandOutput(`sha256sum ${shellquote(fullpath)} 2>/dev/null | awk '{print $1}'`));
+			manifest[file] = {
+				size: filestat.size,
+				sha256: hash
+			};
+		}
+	}
+
+	// Write manifest to staging root
+	const manifest_file = `${staging_root}/homeproxy-backup-manifest.json`;
+	writefile(manifest_file, sprintf('%J', manifest));
+
+	// Create file list including manifest
+	const backup_list = `${work_dir}/backup.list`;
+	let all_files = [ ...files, 'homeproxy-backup-manifest.json' ];
+	writefile(backup_list, join('\n', all_files) + '\n');
+
+	// Build the archive inside the private work_dir (mode 700) under umask 077
+	// so the certificate/key-bearing tarball is never world-readable in /tmp,
+	// then atomically move it into place with restrictive permissions.
+	const temp_tar = `${work_dir}/archive.tar`;
+	const temp_gz = `${work_dir}/archive.tar.gz`;
+	let exit_code = system(`cd ${shellquote(staging_root)} && umask 077 && /bin/tar -cf ${shellquote(temp_tar)} -T ${shellquote(backup_list)}`);
+
+	if (exit_code !== 0) {
+		system(`rm -rf ${shellquote(work_dir)}`);
 		return { result: false, error: `tar 打包失败，退出码 ${exit_code}` };
+	}
+
+	// Compress inside the private work_dir
+	exit_code = system(`umask 077 && gzip -c ${shellquote(temp_tar)} > ${shellquote(temp_gz)}`);
+	if (exit_code !== 0) {
+		system(`rm -rf ${shellquote(work_dir)}`);
+		return { result: false, error: `压缩失败，退出码 ${exit_code}` };
+	}
+
+	// Move into place. umask guards the cross-filesystem copy fallback; the
+	// explicit chmod guards the same-filesystem rename path.
+	system(`rm -f ${shellquote(path)}`);
+	exit_code = system(`umask 077 && mv ${shellquote(temp_gz)} ${shellquote(path)} && chmod 600 ${shellquote(path)}`);
+	system(`rm -rf ${shellquote(work_dir)}`);
+
+	if (exit_code !== 0) {
+		system(`rm -f ${shellquote(path)}`);
+		return { result: false, error: `生成备份文件失败，退出码 ${exit_code}` };
+	}
 
 	const archive = lstat(path);
 	if (!archive || archive.type !== 'file' || archive.size <= 0)
@@ -146,6 +425,139 @@ function createBackupArchive(path) {
 		size: archive.size,
 		files
 	};
+}
+
+function testExtractBackupArchive(path) {
+	// Create private work directory for validation
+	const restore_test_dir = createWorkDir();
+	let exit_code = system(`cd ${shellquote(restore_test_dir)} && /bin/tar -xzf ${shellquote(path)} 2>/dev/null`);
+
+	if (exit_code !== 0) {
+		system(`rm -rf ${shellquote(restore_test_dir)}`);
+		return { result: false, error: `备份文件损坏，无法完整解压，退出码 ${exit_code}` };
+	}
+
+	// Verify manifest (mandatory)
+	const manifest_path = `${restore_test_dir}/homeproxy-backup-manifest.json`;
+	const manifest_content = readfile(manifest_path);
+
+	if (!manifest_content) {
+		system(`rm -rf ${shellquote(restore_test_dir)}`);
+		return { result: false, error: '备份文件缺少完整性清单（homeproxy-backup-manifest.json）' };
+	}
+
+	let manifest = {};
+	try {
+		manifest = json(manifest_content);
+	} catch (e) {
+		system(`rm -rf ${shellquote(restore_test_dir)}`);
+		return { result: false, error: '备份清单格式错误' };
+	}
+
+	// Verify each file's hash
+	for (let file in manifest) {
+		// Verify manifest key itself is in whitelist
+		if (file === 'homeproxy-backup-manifest.json') {
+			system(`rm -rf ${shellquote(restore_test_dir)}`);
+			return { result: false, error: 'manifest 不能包含自身作为恢复目标' };
+		}
+
+		if (!allowedBackupPath(file)) {
+			system(`rm -rf ${shellquote(restore_test_dir)}`);
+			return { result: false, error: `manifest 包含不允许的路径: ${file}` };
+		}
+
+		let fullpath = `${restore_test_dir}/${file}`;
+		let filestat = stat(fullpath);
+
+		if (!filestat || filestat.type !== 'file') {
+			system(`rm -rf ${shellquote(restore_test_dir)}`);
+			return { result: false, error: `备份文件缺失: ${file}` };
+		}
+
+		if (filestat.size !== manifest[file].size) {
+			system(`rm -rf ${shellquote(restore_test_dir)}`);
+			return { result: false, error: `备份文件大小不匹配: ${file}` };
+		}
+
+		let hash = trim(commandOutput(`sha256sum ${shellquote(fullpath)} 2>/dev/null | awk '{print $1}'`));
+		if (hash !== manifest[file].sha256) {
+			system(`rm -rf ${shellquote(restore_test_dir)}`);
+			return { result: false, error: `备份文件校验和不匹配: ${file}` };
+		}
+	}
+
+	// Reverse check: ensure all restorable files in archive are in manifest
+	const fd = popen(`/bin/tar -tzf ${shellquote(path)} 2>&1`);
+	if (fd) {
+		for (let line = fd.read('line'); length(line); line = fd.read('line')) {
+			// Use archiveMemberPath() to normalize path (handles ./path, etc.)
+			let archive_path = archiveMemberPath(line);
+
+			// Skip directories, empty paths, and manifest itself
+			if (!archive_path || archive_path === 'homeproxy-backup-manifest.json')
+				continue;
+
+			// Check if this file would be restored
+			if (allowedBackupPath(archive_path)) {
+				// Must be in manifest
+				if (!manifest[archive_path]) {
+					fd.close();
+					system(`rm -rf ${shellquote(restore_test_dir)}`);
+					return { result: false, error: `归档中存在未记录的可恢复文件: ${archive_path}` };
+				}
+			}
+		}
+		fd.close();
+	}
+
+	// Return work_dir for direct restore (avoid TOCTOU)
+	return { result: true, manifest: manifest, work_dir: restore_test_dir };
+}
+
+function resetBackupTargetPaths() {
+	system('rm -f /etc/config/homeproxy /etc/homeproxy/resources/direct_list.txt /etc/homeproxy/resources/proxy_list.txt');
+	system('rm -rf /etc/homeproxy/certs && mkdir -p /etc/homeproxy/resources /etc/homeproxy/certs');
+}
+
+function extractBackupArchive(work_dir, manifest) {
+	// Copy directly from validated work_dir (already extracted and hash-verified)
+	// This avoids TOCTOU: no re-extraction from potentially modified archive
+
+	// Reset target paths
+	resetBackupTargetPaths();
+
+	// Copy only files that are in manifest (already validated)
+	for (let file in manifest) {
+		let src = `${work_dir}/${file}`;
+		let dst = `/${file}`;
+		let dst_dir = match(dst, /^(.*)\/[^\/]+$/);
+
+		if (dst_dir && dst_dir[1]) {
+			system(`mkdir -p ${shellquote(dst_dir[1])}`);
+		}
+
+		// Copy without preserving permissions (-p removed to avoid permission attacks)
+		let exit_code = system(`cp ${shellquote(src)} ${shellquote(dst)}`);
+		if (exit_code !== 0) {
+			return exit_code;
+		}
+
+		// Normalize permissions based on file type
+		if (match(file, /^etc\/homeproxy\/certs\/[^\/]+$/)) {
+			// Certificates and private keys: restrictive
+			system(`chmod 600 ${shellquote(dst)}`);
+		} else if (file === 'etc/config/homeproxy') {
+			// UCI config: standard config permissions
+			system(`chmod 600 ${shellquote(dst)}`);
+		} else {
+			// Resource lists: readable by owner and group
+			system(`chmod 644 ${shellquote(dst)}`);
+		}
+	}
+
+	// Note: work_dir cleaned up by caller after confirming success
+	return 0;
 }
 
 const methods = {
@@ -283,40 +695,165 @@ const methods = {
 
 	backup_create: {
 		call: function() {
-			return createBackupArchive(BACKUP_ARCHIVE);
+			// Generate new backup path for each request
+			BACKUP_ARCHIVE = '/tmp/homeproxy-backup-' + generateTempSuffix() + '.tar.gz';
+			let result = createBackupArchive(BACKUP_ARCHIVE);
+			if (result.result)
+				result.download_path = BACKUP_ARCHIVE;
+			return result;
+		}
+	},
+	backup_get_upload_path: {
+		call: function() {
+			// Generate and return upload path for frontend
+			const upload_path = '/tmp/homeproxy-restore-' + generateTempSuffix() + '.tar.gz';
+			return { upload_path: upload_path };
+		}
+	},
+	backup_cleanup: {
+		args: { path: 'path' },
+		call: function(req) {
+			const path = req.args?.path;
+
+			// Only allow removing our own backup/restore temp files
+			if (!path || !match(path, /^\/tmp\/homeproxy-(backup|restore)-[a-f0-9]+\.tar\.gz$/))
+				return { result: false, error: '无效的临时文件路径' };
+
+			system(`rm -f ${shellquote(path)}`);
+			return { result: true };
 		}
 	},
 	backup_validate: {
-		call: function() {
-			return validateBackupArchive(RESTORE_ARCHIVE);
+		args: { path: 'path' },
+		call: function(req) {
+			const path = req.args?.path;
+
+			// Validate path format
+			if (!path || !match(path, /^\/tmp\/homeproxy-restore-[a-f0-9]+\.tar\.gz$/)) {
+				return { valid: false, error: '无效的备份文件路径' };
+			}
+
+			// Set RESTORE_ARCHIVE from validated path
+			RESTORE_ARCHIVE = path;
+
+			// Structural check: entry types, path whitelist, required config file
+			const check = validateBackupArchive(RESTORE_ARCHIVE);
+			if (!check.valid)
+				return check;
+
+			// Integrity check: run the same manifest/SHA-256 verification that
+			// restore uses, so an old or forged backup without a valid manifest
+			// is rejected here instead of only after the confirmation dialog.
+			const integrity = testExtractBackupArchive(RESTORE_ARCHIVE);
+			if (integrity.work_dir)
+				system(`rm -rf ${shellquote(integrity.work_dir)}`);
+			if (!integrity.result)
+				return { valid: false, error: integrity.error, files: check.files };
+
+			return check;
 		}
 	},
 	backup_restore: {
-		call: function() {
-			const check = validateBackupArchive(RESTORE_ARCHIVE);
+		args: { path: 'path' },
+		call: function(req) {
+			// Accept path parameter or use stored RESTORE_ARCHIVE
+			const restore_path = req.args?.path || RESTORE_ARCHIVE;
+
+			if (!restore_path) {
+				return { result: false, error: '请先上传并验证备份文件' };
+			}
+
+			// Re-validate path format
+			if (!match(restore_path, /^\/tmp\/homeproxy-restore-[a-f0-9]+\.tar\.gz$/)) {
+				return { result: false, error: '无效的备份文件路径' };
+			}
+
+			const check = validateBackupArchive(restore_path);
 
 			if (!check.valid)
 				return { result: false, error: check.error, files: check.files };
 
+			const extract_check = testExtractBackupArchive(restore_path);
+			if (!extract_check.result)
+				return { result: false, error: extract_check.error, files: check.files };
+
+			// Get validated manifest and work_dir for safe extraction
+			const manifest = extract_check.manifest;
+			const work_dir = extract_check.work_dir;
+
+			// Generate rollback path
+			ROLLBACK_ARCHIVE = '/tmp/homeproxy-rollback-' + generateTempSuffix() + '.tar.gz';
 			const rollback = createBackupArchive(ROLLBACK_ARCHIVE);
-			if (!rollback.result)
+			if (!rollback.result) {
+				system(`rm -rf ${shellquote(work_dir)}`);
 				return { result: false, error: `创建回滚包失败: ${rollback.error}` };
+			}
 
-			system(`rm -rf /etc/homeproxy/certs && mkdir -p /etc/homeproxy/resources /etc/homeproxy/certs`);
-			let exit_code = system(`cd / && /bin/tar -xzf ${shellquote(RESTORE_ARCHIVE)}`);
+			// Get rollback manifest and work_dir for safe extraction
+			const rollback_extract_check = testExtractBackupArchive(ROLLBACK_ARCHIVE);
+			if (!rollback_extract_check.result) {
+				system(`rm -rf ${shellquote(work_dir)}`);
+				return { result: false, error: `回滚包校验失败: ${rollback_extract_check.error}` };
+			}
 
-			if (exit_code !== 0)
-				return { result: false, error: `恢复失败，退出码 ${exit_code}`, rollback: ROLLBACK_ARCHIVE };
+			const rollback_manifest = rollback_extract_check.manifest;
+			const rollback_work_dir = rollback_extract_check.work_dir;
 
+			let exit_code = extractBackupArchive(work_dir, manifest);
+
+			if (exit_code !== 0) {
+				system(`rm -rf ${shellquote(work_dir)}`);
+				let rollback_code = extractBackupArchive(rollback_work_dir, rollback_manifest);
+				system(`rm -rf ${shellquote(rollback_work_dir)}`);
+				system('/sbin/uci commit homeproxy');
+				system('/etc/init.d/homeproxy restart >/dev/null 2>&1');
+
+				if (rollback_code === 0)
+					return { result: false, error: `恢复失败，已自动回滚，退出码 ${exit_code}`, rollback: ROLLBACK_ARCHIVE };
+
+				return { result: false, error: `恢复失败且自动回滚失败，恢复退出码 ${exit_code}，回滚退出码 ${rollback_code}`, rollback: ROLLBACK_ARCHIVE };
+			}
+
+			// Re-run config migration on the restored config so security
+			// defaults (loopback-bound Clash API controller and a generated
+			// secret) and any version migrations are re-applied. Without this,
+			// restoring an older backup would reintroduce a LAN-exposed,
+			// unauthenticated Clash API.
+			system(`ucode ${HP_DIR}/scripts/migrate_config.uc >/dev/null 2>&1`);
+
+			let adjustments = normalizeRestoredLocalControllers();
 			system('/sbin/uci commit homeproxy');
-			system(`rm -f ${shellquote(RESTORE_ARCHIVE)} /tmp/luci-indexcache.*`);
+			system(`rm -f ${shellquote(restore_path)} /tmp/luci-indexcache.*`);
 			system('rm -rf /tmp/luci-modulecache/ 2>/dev/null');
 			system('/etc/init.d/homeproxy restart >/dev/null 2>&1');
+
+			// Verify service started successfully and the restored runtime
+			// configs are valid. procd may report "active with no instances"
+			// with exit code 0, so status alone is not a sufficient check.
+			sleep(2000);
+			let service_check = validateRestoredService();
+
+			if (!service_check.result) {
+				// Service failed to start, rollback
+				let rollback_code = extractBackupArchive(rollback_work_dir, rollback_manifest);
+				system(`rm -rf ${shellquote(work_dir)} ${shellquote(rollback_work_dir)}`);
+				system('/sbin/uci commit homeproxy');
+				system('/etc/init.d/homeproxy restart >/dev/null 2>&1');
+
+				if (rollback_code === 0)
+					return { result: false, error: `${service_check.error}，已自动回滚`, rollback: ROLLBACK_ARCHIVE };
+
+				return { result: false, error: `${service_check.error}，且自动回滚失败`, rollback: ROLLBACK_ARCHIVE };
+			}
+
+			// Success, clean up work directories
+			system(`rm -rf ${shellquote(work_dir)} ${shellquote(rollback_work_dir)}`);
 
 			return {
 				result: true,
 				files: check.files,
-				rollback: ROLLBACK_ARCHIVE
+				rollback: ROLLBACK_ARCHIVE,
+				adjustments
 			};
 		}
 	},
@@ -330,7 +867,7 @@ const methods = {
 			const type = req.args?.type;
 			let result = {};
 
-			const fd = popen('/usr/bin/sing-box generate ' + type + ` ${req.args?.params || ''}`);
+			const fd = popen('/usr/bin/sing-box generate ' + type + ' ' + shellquote(req.args?.params || ''));
 			if (fd) {
 				let ech_cfg_set = false;
 				let ech_key_set = false;
@@ -401,8 +938,13 @@ const methods = {
 	resources_get_version: {
 		args: { type: 'type' },
 		call: function(req) {
-			const version = trim(readfile(`${HP_DIR}/resources/${req.args?.type}.ver`));
-			return { version: version, error: error() };
+			const allowed_types = [ 'china_ip4', 'china_ip6', 'china_list', 'gfw_list' ];
+
+			if (index(allowed_types, req.args?.type) === -1)
+				return { version: null, error: 'invalid resource type' };
+
+			const version = trim(readfile(`${HP_DIR}/resources/${req.args?.type}.ver`) || '');
+			return { version, error: error() };
 		}
 	},
 	resources_update: {

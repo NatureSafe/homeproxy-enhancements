@@ -10,8 +10,9 @@
 'require ui';
 'require view';
 
-const backupPath = '/tmp/homeproxy-backup.tar.gz';
-const restorePath = '/tmp/homeproxy-restore.tar.gz';
+// Session state for dynamic paths
+let currentBackupPath = null;
+let currentRestorePath = null;
 
 const callBackupCreate = rpc.declare({
 	object: 'luci.homeproxy',
@@ -19,15 +20,30 @@ const callBackupCreate = rpc.declare({
 	expect: { '': {} }
 });
 
+const callBackupGetUploadPath = rpc.declare({
+	object: 'luci.homeproxy',
+	method: 'backup_get_upload_path',
+	expect: { '': {} }
+});
+
+const callBackupCleanup = rpc.declare({
+	object: 'luci.homeproxy',
+	method: 'backup_cleanup',
+	params: ['path'],
+	expect: { '': {} }
+});
+
 const callBackupValidate = rpc.declare({
 	object: 'luci.homeproxy',
 	method: 'backup_validate',
+	params: ['path'],
 	expect: { '': {} }
 });
 
 const callBackupRestore = rpc.declare({
 	object: 'luci.homeproxy',
 	method: 'backup_restore',
+	params: ['path'],
 	expect: { '': {} }
 });
 
@@ -41,8 +57,10 @@ function downloadFile(path, filename) {
 		a.download = filename;
 		document.body.appendChild(a);
 		a.click();
-		a.remove();
-		window.URL.revokeObjectURL(url);
+		window.setTimeout(() => {
+			a.remove();
+			window.URL.revokeObjectURL(url);
+		}, 100);
 	});
 }
 
@@ -68,10 +86,17 @@ return view.extend({
 			if (!res.result)
 				throw new Error(res.error || _('生成备份文件失败。'));
 
+			// Save the backup path for downloading
+			currentBackupPath = res.download_path || res.path;
+			if (!currentBackupPath)
+				throw new Error(_('未返回备份文件路径。'));
+
 			const filename = 'homeproxy-backup-%s.tar.gz'.format((new Date()).toISOString().replace(/[:.]/g, '-'));
 
-			return downloadFile(backupPath, filename).then(() => {
+			return downloadFile(currentBackupPath, filename).then(() => {
 				ui.addNotification(null, E('p', _('备份文件已生成并开始下载。')), 'info');
+				// Clean up server-side backup file after download (contains certificates and private keys)
+				return L.resolveDefault(callBackupCleanup(currentBackupPath), {});
 			});
 		}).catch((err) => {
 			ui.addNotification(null, E('p', err.message || err));
@@ -85,9 +110,17 @@ return view.extend({
 
 		setButtonText(btn, _('正在上传备份文件...'));
 
-		return ui.uploadFile(restorePath).then(() => {
+		// Request upload path from backend
+		return L.resolveDefault(callBackupGetUploadPath(), {}).then((res) => {
+			if (!res.upload_path)
+				throw new Error(_('无法获取上传路径'));
+
+			currentRestorePath = res.upload_path;
+
+			return ui.uploadFile(currentRestorePath);
+		}).then(() => {
 			setButtonText(btn, _('正在检查备份文件...'));
-			return L.resolveDefault(callBackupValidate(), {});
+			return L.resolveDefault(callBackupValidate(currentRestorePath), {});
 		}).then((res) => {
 			if (!res.valid)
 				throw new Error(res.error || _('上传的备份文件无效。'));
@@ -99,7 +132,7 @@ return view.extend({
 					E('button', {
 						'class': 'btn',
 						'click': ui.createHandlerFn(this, () => {
-							return fs.remove(restorePath).finally(ui.hideModal);
+							return L.resolveDefault(callBackupCleanup(currentRestorePath), {}).finally(ui.hideModal);
 						})
 					}, [ _('取消') ]),
 					' ',
@@ -111,7 +144,7 @@ return view.extend({
 			]);
 		}).catch((err) => {
 			ui.addNotification(null, E('p', err.message || err));
-			return fs.remove(restorePath).catch(() => {});
+			return L.resolveDefault(callBackupCleanup(currentRestorePath), {});
 		}).finally(() => {
 			setButtonText(btn, _('上传备份文件...'));
 		});
@@ -122,7 +155,7 @@ return view.extend({
 			E('p', { 'class': 'spinning' }, _('正在应用备份文件并重启 HomeProxy。'))
 		]);
 
-		return L.resolveDefault(callBackupRestore(), {}).then((res) => {
+		return L.resolveDefault(callBackupRestore(currentRestorePath), {}).then((res) => {
 			if (!res.result)
 				throw new Error(res.error || _('恢复失败。'));
 
@@ -151,7 +184,7 @@ return view.extend({
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('备份')),
 				E('div', { 'class': 'cbi-section-descr' },
-					_('下载包含 /etc/config/homeproxy、自定义直连/代理列表，以及已上传证书和私钥的 tar.gz 备份文件。')),
+					_('下载包含 /etc/config/homeproxy、自定义直连/代理列表，以及已上传证书和私钥的 tar.gz 备份文件。备份内含明文私钥，请妥善保管，避免在不可信渠道传输或存储；恢复时仅校验文件完整性（SHA-256 清单），不验证来源真实性。')),
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, _('下载备份')),
 					E('div', { 'class': 'cbi-value-field' }, [

@@ -8,7 +8,7 @@
 'use strict';
 
 import { cursor } from 'uci';
-import { isEmpty, parseURL } from 'homeproxy';
+import { executeCommand, isEmpty, parseURL } from 'homeproxy';
 
 const uci = cursor();
 
@@ -26,6 +26,130 @@ const uciinfra = 'infra',
       uciroutingnode = 'routing_node',
       uciroutingrule = 'routing_rule',
       uciserver = 'server';
+
+function firstValue(value) {
+	return (type(value) === 'array') ? value[0] : value;
+}
+
+function stripCidr(value) {
+	return replace(trim(firstValue(value) || ''), /\/.*$/, '');
+}
+
+function isIPv4Address(value) {
+	return !!match(value || '', /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/);
+}
+
+function isPortableBindHost(value) {
+	value = lc(trim(value || ''));
+
+	return value === 'localhost' ||
+		value === '0.0.0.0' ||
+		value === '::' ||
+		value === '[::]' ||
+		value === '::1' ||
+		value === '[::1]' ||
+		!!match(value, /^127\./);
+}
+
+function appendIPv4Address(addresses, value) {
+	value = stripCidr(value);
+
+	if (isIPv4Address(value) && index(addresses, value) === -1)
+		push(addresses, value);
+}
+
+function localIPv4Addresses() {
+	const netuci = cursor();
+	let addresses = [];
+
+	netuci.load('network');
+
+	let lan_ipaddr = netuci.get('network', 'lan', 'ipaddr');
+	if (type(lan_ipaddr) === 'array') {
+		for (let addr in lan_ipaddr)
+			appendIPv4Address(addresses, addr);
+	} else {
+		appendIPv4Address(addresses, lan_ipaddr);
+	}
+
+	const ip_addresses = executeCommand('/sbin/ip -4 -o addr show scope global')?.stdout || '';
+	for (let line in split(ip_addresses, /\n/)) {
+		let matched = match(line, /[ \t]inet[ \t]+([0-9.]+)(\/[0-9]+)?[ \t]/);
+		if (matched)
+			appendIPv4Address(addresses, matched[1]);
+	}
+
+	return addresses;
+}
+
+function parseController(value, default_port) {
+	value = trim(replace(firstValue(value) || '', /^https?:\/\//, ''));
+	value = replace(value, /\/.*$/, '');
+
+	let matched = match(value, /^\[([^\]]+)\](:([0-9]+))?$/);
+	if (matched)
+		return { host: matched[1], port: int(matched[3] || default_port) };
+
+	matched = match(value, /^([^:]+):([0-9]+)$/);
+	if (matched)
+		return { host: matched[1], port: int(matched[2]) };
+
+	return { host: value, port: int(default_port) };
+}
+
+function formatController(host, port) {
+	return sprintf((index(host, ':') >= 0) ? '[%s]:%d' : '%s:%d', host, port);
+}
+
+/* Generate a random 256-bit hex secret for the Clash API. Returns null when no
+ * usable randomness source is available, in which case the caller leaves the
+ * secret unset rather than installing a predictable value. */
+function generateClashSecret() {
+	let secret = trim(executeCommand("head -c 32 /dev/urandom | hexdump -v -e '1/1 \"%02x\"'")?.stdout || '');
+	if (!match(secret, /^[a-f0-9]{64}$/))
+		secret = trim(executeCommand('tr -dc a-f0-9 < /dev/urandom | head -c 64')?.stdout || '');
+
+	return match(secret, /^[a-f0-9]{32,}$/) ? secret : null;
+}
+
+function normalizeLocalControllerOption(local_addresses, fallback_host, option, default_port, set_when_empty) {
+	let value = uci.get(uciconfig, ucimain, option);
+
+	if (isEmpty(value)) {
+		if (set_when_empty)
+			uci.set(uciconfig, ucimain, option, formatController(fallback_host, default_port));
+
+		return;
+	}
+
+	let controller = parseController(value, default_port),
+	    host = controller.host;
+
+	if (isEmpty(host))
+		host = fallback_host;
+	else if (isPortableBindHost(host))
+		return;
+	else if (!isIPv4Address(host) || index(local_addresses, host) !== -1)
+		return;
+
+	uci.set(uciconfig, ucimain, option, formatController(fallback_host, controller.port || default_port));
+}
+
+function normalizeLocalControllerOptions() {
+	let local_addresses = localIPv4Addresses(),
+	    fallback_host = local_addresses[0];
+
+	if (isEmpty(fallback_host))
+		return;
+
+	/* clash_api_external_controller is intentionally pinned to loopback (see
+	 * below) and must NOT be rewritten to the LAN address. Only the LAN-facing
+	 * display proxy is bound to a reachable local address here. */
+	for (let item in [
+		[ 'clash_api_proxy_external_controller', 9091, true ]
+	])
+		normalizeLocalControllerOption(local_addresses, fallback_host, item[0], item[1], item[2]);
+}
 
 /* chinadns-ng has been removed */
 if (uci.get(uciconfig, uciinfra, 'china_dns_port'))
@@ -79,8 +203,32 @@ if (isEmpty(uci.get(uciconfig, uciserver, 'log_level')))
 if (isEmpty(uci.get(uciconfig, ucimain, 'clash_api_enabled')))
 	uci.set(uciconfig, ucimain, 'clash_api_enabled', '1');
 
-if (isEmpty(uci.get(uciconfig, ucimain, 'clash_api_external_controller')))
-	uci.set(uciconfig, ucimain, 'clash_api_external_controller', '192.168.9.1:9090');
+/* Bind sing-box's own Clash API controller to loopback so it is never
+ * reachable directly from the LAN; dashboards reach it only through the
+ * filtering display proxy. Existing LAN-bound controllers are migrated to
+ * 127.0.0.1 once (port preserved); a later deliberate change is left alone. */
+const clash_external = uci.get(uciconfig, ucimain, 'clash_api_external_controller');
+if (isEmpty(clash_external)) {
+	uci.set(uciconfig, ucimain, 'clash_api_external_controller', '127.0.0.1:9090');
+} else if (isEmpty(uci.get(uciconfig, ucimigration, 'clash_api_localhost'))) {
+	const clash_controller = parseController(clash_external, 9090);
+	if (!isPortableBindHost(clash_controller.host))
+		uci.set(uciconfig, ucimain, 'clash_api_external_controller',
+			formatController('127.0.0.1', clash_controller.port || 9090));
+}
+uci.set(uciconfig, ucimigration, 'clash_api_localhost', '1');
+
+/* sing-box's Clash API performs NO authentication when the secret is empty,
+ * and the LAN-facing display proxy forwards to it, so anyone able to reach the
+ * proxy could otherwise control the proxy without credentials. Generate a
+ * random secret when none is configured. */
+if (isEmpty(uci.get(uciconfig, ucimain, 'clash_api_secret'))) {
+	const clash_secret = generateClashSecret();
+	if (!isEmpty(clash_secret))
+		uci.set(uciconfig, ucimain, 'clash_api_secret', clash_secret);
+}
+
+normalizeLocalControllerOptions();
 
 if (isEmpty(uci.get(uciconfig, ucimain, 'clash_api_default_mode')))
 	uci.set(uciconfig, ucimain, 'clash_api_default_mode', 'Rule');

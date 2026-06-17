@@ -17,6 +17,14 @@ const uciconfig = 'homeproxy';
 const ucimain = 'config';
 const shadowtls_suffix = '-out-shadowtls';
 const filter_timeout = 10000;
+const fallback_delay_limit = 5;
+const upstream_read_timeout = 5;  // seconds; total read deadline for synchronous fetchUpstream
+
+// Resource limits
+const MAX_CONNECTIONS = 64;
+const MAX_REQUEST_BUFFER_SIZE = 256 * 1024;  // 256KB
+const MAX_RESPONSE_BUFFER_SIZE = 8 * 1024 * 1024;  // 8MB
+const CLIENT_IDLE_TIMEOUT = 30000;  // 30 seconds
 
 let next_id = 1;
 let connections = {};
@@ -412,6 +420,11 @@ function closeConnection(conn) {
 		conn.timer = null;
 	}
 
+	if (conn.idle_timer) {
+		conn.idle_timer.cancel();
+		conn.idle_timer = null;
+	}
+
 	if (conn.client) {
 		conn.client.close();
 		conn.client = null;
@@ -439,8 +452,17 @@ function buildJsonResponse(request, payload) {
 	    origin = headerValue(request.headers, 'Origin');
 
 	if (!isEmpty(origin)) {
-		push(headers, 'Access-Control-Allow-Origin: ' + origin);
-		push(headers, 'Vary: Origin');
+		// Only allow known dashboard origins
+		const allowed_origins = [
+			'https://metacubexd.pages.dev',
+			'https://yacd.metacubex.one',
+			'https://yacd.haishan.me'
+		];
+
+		if (index(allowed_origins, origin) >= 0) {
+			push(headers, 'Access-Control-Allow-Origin: ' + origin);
+			push(headers, 'Vary: Origin');
+		}
 	}
 
 	push(headers, 'Content-Length: ' + length(body));
@@ -496,6 +518,13 @@ function upstreamRequest(method, path, request, body) {
 	return join("\r\n", headers) + "\r\n\r\n" + body;
 }
 
+// Synchronous upstream fetch for filtered responses.
+// NOTE: This blocks the event loop, so reads are bounded by a total deadline
+// (upstream_read_timeout) and each recv waits for readiness via socket.poll().
+// An upstream that accepts the connection but never replies therefore can no
+// longer hang the proxy indefinitely. Only used for /proxies and /group/*/delay
+// paths; regular relay paths use async event-driven forwarding.
+// TODO: Convert to async uloop-based implementation to avoid blocking entirely.
 function fetchUpstream(method, path, request, body) {
 	let upstream = socket.connect(target.host, target.port, null, 3000);
 
@@ -509,7 +538,22 @@ function fetchUpstream(method, path, request, body) {
 		return null;
 	}
 
+	// Total read deadline. time() is whole seconds, which is adequate here.
+	let deadline = time() + upstream_read_timeout;
+
+	// Cap iterations as a secondary bound: max 512 × 16KB = 8MB.
 	for (let i = 0; i < 512; i++) {
+		let remaining = (deadline - time()) * 1000;
+		if (remaining <= 0)
+			break;
+
+		// Wait up to the remaining budget (in <=1s slices) for readable data.
+		// Empty result means the slice elapsed with no data: loop and re-check
+		// the deadline rather than blocking in recv().
+		let ready = socket.poll((remaining < 1000) ? remaining : 1000, [ upstream, socket.POLLIN ]);
+		if (!length(ready))
+			continue;
+
 		let chunk = upstream.recv(16384);
 
 		if (chunk === null)
@@ -526,7 +570,7 @@ function fetchUpstream(method, path, request, body) {
 
 	upstream.close();
 
-	return raw;
+	return length(raw) ? raw : null;
 }
 
 function fetchVisibleProxyGroup(group_name, request) {
@@ -566,14 +610,26 @@ function fallbackGroupDelay(group_info, request) {
 	if (group === null || type(group.all) !== 'array')
 		return null;
 
-	let results = {};
+	let results = {},
+	    tested = 0,
+	    truncated = false;
 
 	for (let proxy_name in group.all) {
 		if (isShadowTlsTag(proxy_name))
 			continue;
 
+		if (tested >= fallback_delay_limit) {
+			truncated = true;
+			break;
+		}
+
 		results[proxy_name] = testProxyDelay(proxy_name, group_info.query, request);
+		tested++;
 	}
+
+	if (truncated)
+		warn(sprintf('homeproxy clash api proxy: fallback delay for group %s limited to first %d visible proxies\n',
+			group_info.name, fallback_delay_limit));
 
 	return results;
 }
@@ -619,11 +675,22 @@ function relayRead(conn, from, to) {
 		return;
 	}
 
+	// Reset idle timer on data activity
+	if (conn.idle_timer && length(received.data) > 0) {
+		conn.idle_timer.set(CLIENT_IDLE_TIMEOUT);
+	}
+
 	if (received.eof)
 		closeConnection(conn);
 }
 
 function setupRelay(conn) {
+	// Set idle timer for relay phase (30s idle timeout)
+	conn.idle_timer = uloop.timer(CLIENT_IDLE_TIMEOUT, () => {
+		warn(`Connection ${conn.id} idle timeout during relay\n`);
+		closeConnection(conn);
+	});
+
 	conn.client_handle = uloop.handle(conn.client, (events, eof, error) => {
 		if (events & uloop.ULOOP_READ)
 			relayRead(conn, conn.client, conn.upstream);
@@ -655,6 +722,12 @@ function setupFilteredResponse(conn) {
 			let received = recvAvailable(conn.upstream);
 
 			if (length(received.data)) {
+				// Check response buffer size limit
+				if (length(conn.response_buffer) + length(received.data) > MAX_RESPONSE_BUFFER_SIZE) {
+					warn(`Connection ${conn.id} response buffer exceeded ${MAX_RESPONSE_BUFFER_SIZE} bytes\n`);
+					closeConnection(conn);
+					return;
+				}
 				conn.response_buffer += received.data;
 				resetTimer(conn);
 			}
@@ -721,11 +794,23 @@ function onClientRequest(conn, events, eof, error) {
 	if (events & uloop.ULOOP_READ) {
 		let received = recvAvailable(conn.client);
 
-		if (length(received.data))
+		if (length(received.data)) {
+			// Check request buffer size limit
+			if (length(conn.request_buffer) + length(received.data) > MAX_REQUEST_BUFFER_SIZE) {
+				warn(`Connection ${conn.id} request buffer exceeded ${MAX_REQUEST_BUFFER_SIZE} bytes\n`);
+				closeConnection(conn);
+				return;
+			}
 			conn.request_buffer += received.data;
+		}
 
 		let request = parseHttpMessage(conn.request_buffer);
 		if (request !== null) {
+			// Cancel idle timer when request is complete
+			if (conn.idle_timer) {
+				conn.idle_timer.cancel();
+				delete conn.idle_timer;
+			}
 			startUpstream(conn, request);
 			return;
 		}
@@ -742,6 +827,18 @@ function onClientRequest(conn, events, eof, error) {
 
 function acceptClients(server) {
 	while (true) {
+		// Check connection limit
+		let active_connections = length(keys(connections));
+		if (active_connections >= MAX_CONNECTIONS) {
+			// Accept and immediately close to reject (don't leave in backlog)
+			let rejected = server.accept();
+			if (rejected) {
+				rejected.close();
+			}
+			warn(`Connection limit reached: ${active_connections}/${MAX_CONNECTIONS}\n`);
+			break;
+		}
+
 		let client = server.accept();
 
 		if (client === null)
@@ -755,10 +852,18 @@ function acceptClients(server) {
 			upstream_handle: null,
 			timer: null,
 			request_buffer: '',
-			response_buffer: ''
+			response_buffer: '',
+			created_at: time()
 		};
 
 		connections[conn.id] = conn;
+
+		// Set idle timeout (uloop.timer signature: timeout_ms, callback)
+		conn.idle_timer = uloop.timer(CLIENT_IDLE_TIMEOUT, () => {
+			warn(`Connection ${conn.id} idle timeout\n`);
+			closeConnection(conn);
+		});
+
 		conn.client_handle = uloop.handle(client, (events, eof, error) => onClientRequest(conn, events, eof, error), uloop.ULOOP_READ);
 	}
 }

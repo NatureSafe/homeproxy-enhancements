@@ -17,6 +17,21 @@
 'require tools.firewall as fwtool';
 'require tools.widgets as widgets';
 
+// Form field factory (only the helper actually used is kept)
+const fieldFactory = {
+	uintField(section, tab, name, label, placeholder, depends) {
+		let field = section.taboption(tab, form.Value, name, label);
+		field.datatype = 'uinteger';
+		if (placeholder) field.placeholder = placeholder;
+		if (depends) {
+			for (let key in depends)
+				field.depends(key, depends[key]);
+		}
+		field.modalonly = true;
+		return field;
+	}
+};
+
 const callServiceList = rpc.declare({
 	object: 'service',
 	method: 'list',
@@ -208,11 +223,17 @@ return view.extend({
 			});
 		};
 
+		let pathCache = {};
 		let selectorHasPath = function(start, target, seen) {
 			if (!start || !target)
 				return false;
 			if (start === target)
 				return true;
+
+			let key = start + '->' + target;
+			if (pathCache[key] !== undefined)
+				return pathCache[key];
+
 			if (seen[start])
 				return false;
 
@@ -235,6 +256,7 @@ return view.extend({
 					found = true;
 			});
 
+			pathCache[key] = found;
 			return found;
 		};
 
@@ -276,17 +298,15 @@ return view.extend({
 		o.depends('main_node', 'urltest');
 		o.rmempty = false;
 
-		o = s.taboption('routing', form.Value, 'main_urltest_interval', _('Test interval'),
-			_('The test interval in seconds.'));
-		o.datatype = 'uinteger';
-		o.placeholder = '180';
-		o.depends('main_node', 'urltest');
+		o = fieldFactory.uintField(s, 'routing', 'main_urltest_interval', _('Test interval'),
+			'180', {'main_node': 'urltest'});
+		o.description = _('The test interval in seconds.');
+		o.modalonly = false;
 
-		o = s.taboption('routing', form.Value, 'main_urltest_tolerance', _('Test tolerance'),
-			_('The test tolerance in milliseconds.'));
-		o.datatype = 'uinteger';
-		o.placeholder = '50';
-		o.depends('main_node', 'urltest');
+		o = fieldFactory.uintField(s, 'routing', 'main_urltest_tolerance', _('Test tolerance'),
+			'50', {'main_node': 'urltest'});
+		o.description = _('The test tolerance in milliseconds.');
+		o.modalonly = false;
 
 		o = s.taboption('routing', form.ListValue, 'main_udp_node', _('Main UDP node'));
 		o.value('nil', _('Disable'));
