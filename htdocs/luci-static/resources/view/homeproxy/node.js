@@ -7,6 +7,7 @@
 'use strict';
 'require form';
 'require fs';
+'require rpc';
 'require uci';
 'require ui';
 'require view';
@@ -14,9 +15,186 @@
 'require homeproxy as hp';
 'require tools.widgets as widgets';
 
+const TCPING_MAX_NODES = 300;
+const callNodesTcping = rpc.declare({
+	object: 'luci.homeproxy_tcping',
+	method: 'nodes_tcping',
+	params: [ 'sections' ],
+	expect: { '': {} }
+});
+
+const callConfigGet = rpc.declare({
+	object: 'luci.homeproxy_config',
+	method: 'config_get',
+	expect: { values: {} }
+});
+
 function allowInsecureConfirm(ev, _section_id, value) {
 	if (value === '1' && !confirm(_('Are you sure to allow insecure?')))
 		ev.target.firstElementChild.checked = null;
+}
+
+function nodeTcpingId(section_id) {
+	return 'homeproxy-node-tcping-' + String(section_id).replace(/[^A-Za-z0-9_-]/g, (c) =>
+		'_' + c.charCodeAt(0).toString(16) + '_');
+}
+
+function setButtonText(btn, text) {
+	if (!btn)
+		return;
+
+	if (btn.firstChild && btn.firstChild.nodeType === 3)
+		btn.firstChild.data = text;
+	else
+		btn.textContent = text;
+}
+
+function setTcpingResult(section_id, text, color, title) {
+	let el = document.getElementById(nodeTcpingId(section_id));
+
+	if (!el)
+		return false;
+
+	el.textContent = text;
+	el.title = title || '';
+	el.style.setProperty('color', color || '');
+
+	return true;
+}
+
+function getTcpingResult(section_id) {
+	let el = document.getElementById(nodeTcpingId(section_id));
+
+	if (!el)
+		return null;
+
+	return {
+		text: el.textContent,
+		color: el.style.getPropertyValue('color') || '',
+		title: el.title || ''
+	};
+}
+
+function restoreTcpingResult(section_id, previous, title) {
+	if (previous)
+		return setTcpingResult(section_id, previous.text, previous.color, title || previous.title);
+
+	return setTcpingResult(section_id, '-', '', title);
+}
+
+function renderTcpingResult(section_id, result) {
+	let target = result?.target || '',
+	    error = result?.error || '',
+	    title = [ target, error ].filter((v) => v).join(' ');
+
+	switch (result?.status) {
+	case 'ok':
+		setTcpingResult(section_id, '%d ms'.format(result.delay), 'green', title);
+		break;
+	case 'timeout':
+		setTcpingResult(section_id, '超时', 'red', title);
+		break;
+	case 'unsupported':
+		setTcpingResult(section_id, '不支持', 'gray', title);
+		break;
+	case 'invalid':
+		setTcpingResult(section_id, '无地址', 'red', title);
+		break;
+	case 'missing':
+		setTcpingResult(section_id, '不存在', 'red', title);
+		break;
+	case 'skipped':
+		setTcpingResult(section_id, '跳过', 'gray', title);
+		break;
+	case 'unloaded':
+		setTcpingResult(section_id, '未加入', 'gray', title);
+		break;
+	case 'unchanged':
+	case 'no_result':
+		return false;
+	default:
+		setTcpingResult(section_id, '失败', 'red', title);
+		break;
+	}
+
+	return true;
+}
+
+function runNodesTcping(section_ids, ev) {
+	let btn = ev?.currentTarget || ev?.target,
+	    oldText = btn?.textContent,
+	    test_sections = section_ids.slice(0, TCPING_MAX_NODES),
+	    skipped_sections = section_ids.slice(TCPING_MAX_NODES),
+	    previous_results = {},
+	    failed_count = 0;
+
+	if (!section_ids.length) {
+		ui.addNotification(null, E('p', '没有可测试的节点。'));
+		return Promise.resolve();
+	}
+
+	let visible = 0;
+
+	for (let section_id of test_sections) {
+		previous_results[section_id] = getTcpingResult(section_id);
+		if (setTcpingResult(section_id, '测试中...', 'gray'))
+			visible++;
+	}
+	for (let section_id of skipped_sections)
+		renderTcpingResult(section_id, {
+			status: 'skipped',
+			error: '一次最多测试 %d 个节点'.format(TCPING_MAX_NODES)
+		});
+
+	if (!visible)
+		ui.addNotification(null, E('p', '当前页面没有找到延迟列，请强制刷新页面后重试。'));
+
+	if (btn) {
+		btn.disabled = true;
+		setButtonText(btn, '测试中...');
+	}
+
+	return L.resolveDefault(callNodesTcping(test_sections), {}).then((res) => {
+		if (!res.result)
+			throw new Error(res.error || '连通性测试失败。');
+
+		let nodes = res.nodes || {};
+		for (let section_id of test_sections) {
+			let result = nodes[section_id];
+			if (result?.status === 'unchanged' || result?.status === 'no_result') {
+				let title = [ result?.target || '', result?.error || '' ].filter((v) => v).join(' ');
+				restoreTcpingResult(section_id, previous_results[section_id], title);
+				continue;
+			}
+
+			renderTcpingResult(section_id, result);
+			if (result?.status !== 'ok' && result?.status !== 'unloaded' && result?.status !== 'skipped' &&
+			    result?.status !== 'unchanged' && result?.status !== 'no_result')
+				failed_count++;
+		}
+
+		if (res.warning)
+			ui.addNotification(null, E('p', res.warning));
+	}).catch((err) => {
+		let message = err.message || String(err);
+
+		for (let section_id of test_sections)
+			restoreTcpingResult(section_id, previous_results[section_id], message);
+
+		ui.addNotification(null, E('p', message));
+	}).then(() => {
+		if (skipped_sections.length)
+			ui.addNotification(null, E('p', '已跳过 %d 个节点，一次最多测试 %d 个节点。'.format(
+				skipped_sections.length, TCPING_MAX_NODES)));
+
+		if (failed_count)
+			ui.addNotification(null, E('p', '%d 个节点连通性测试失败。'.format(failed_count)));
+
+		if (btn) {
+			btn.disabled = false;
+			setButtonText(btn, oldText || '连通性测试');
+		}
+	});
 }
 
 function parseShareLink(uri, features) {
@@ -454,6 +632,16 @@ function renderNodeSettings(section, data, features, main_node, routing_mode) {
 	o.datatype = 'port';
 	o.depends({'type': 'direct', '!reverse': true});
 	o.rmempty = false;
+
+	o = s.option(form.DummyValue, '_tcping_delay', '延迟');
+	o.editable = true;
+	o.rmempty = true;
+	o.renderWidget = function(section_id) {
+		return E('span', {
+			id: nodeTcpingId(section_id),
+			class: 'homeproxy-node-tcping'
+		}, '-');
+	}
 
 	o = s.option(form.Value, 'username', _('Username'));
 	o.depends('type', 'http');
@@ -1252,7 +1440,11 @@ function renderNodeSettings(section, data, features, main_node, routing_mode) {
 return view.extend({
 	load() {
 		return Promise.all([
-			uci.load('homeproxy'),
+			callConfigGet().then((values) => {
+				uci.state.values.homeproxy = values;
+				uci.loaded.homeproxy = Promise.resolve(values);
+				return 'homeproxy';
+			}),
 			hp.getBuiltinFeatures()
 		]);
 	},
@@ -1272,6 +1464,34 @@ return view.extend({
 			subinfo.push({ 'hash': urlhash, 'title': title });
 		}
 
+		let isSubscriptionGrouphash = function(grouphash) {
+			for (let info of subinfo)
+				if (info.hash === grouphash)
+					return true;
+
+			return false;
+		};
+
+		let collectNodeSections = function(grouphash) {
+			let sections = [];
+
+			uci.sections(data[0], 'node', (res) => {
+				if (grouphash ? res.grouphash === grouphash : !isSubscriptionGrouphash(res.grouphash))
+					sections.push(res['.name']);
+			});
+
+			return sections;
+		};
+
+		let addTcpingButton = function(tab, option, grouphash) {
+			o = s.taboption(tab, form.Button, option, '');
+			o.inputstyle = 'action';
+			o.inputtitle = '连通性测试';
+			o.onclick = function(ev) {
+				return runNodesTcping(collectNodeSections(grouphash), ev);
+			}
+		};
+
 		m = new form.Map('homeproxy', _('Edit nodes'));
 
 		s = m.section(form.NamedSection, 'subscription', 'homeproxy');
@@ -1279,6 +1499,7 @@ return view.extend({
 		/* Node settings start */
 		/* User nodes start */
 		s.tab('node', _('Nodes'));
+		addTcpingButton('node', '_tcping_node');
 		o = s.taboption('node', form.SectionValue, '_node', form.GridSection, 'node');
 		ss = renderNodeSettings(o.subsection, data, features, main_node, routing_mode);
 		ss.addremove = true;
@@ -1384,6 +1605,7 @@ return view.extend({
 		/* Subscription nodes start */
 		for (const info of subinfo) {
 			s.tab('sub_' + info.hash, _('Sub (%s)').format(info.title));
+			addTcpingButton('sub_' + info.hash, '_tcping_' + info.hash, info.hash);
 			o = s.taboption('sub_' + info.hash, form.SectionValue, '_sub_' + info.hash, form.GridSection, 'node');
 			ss = renderNodeSettings(o.subsection, data, features, main_node, routing_mode);
 			ss.filter = function(section_id) {
