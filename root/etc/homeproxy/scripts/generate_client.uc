@@ -14,8 +14,9 @@ import { cursor } from 'uci';
 
 import {
 	isEmpty, parseURL, strToBool, strToInt, strToTime,
-	removeBlankAttrs, validation, HP_DIR, RUN_DIR
+	removeBlankAttrs, shellQuote, validation, HP_DIR, RUN_DIR
 } from 'homeproxy';
+import { build_outbound_tag_map } from 'outbound_tag';
 
 // Configuration error collection
 let config_errors = [];
@@ -487,6 +488,69 @@ function has_outbound_tag(client_config, tag) {
 	return false;
 }
 
+function delay_test_skip_reason(node) {
+	if (type(node) !== 'object' || isEmpty(node))
+		return '节点配置为空';
+
+	if (isEmpty(node.type))
+		return '缺少节点类型';
+
+	if (node.type in ['direct', 'block'])
+		return '直连或阻断节点不测速';
+
+	if (isEmpty(node.address) || isEmpty(node.port))
+		return '缺少地址或端口';
+
+	if (!validation('port', node.port))
+		return '端口格式无效';
+
+	return null;
+}
+
+function delay_test_tmp_path(tag) {
+	return RUN_DIR + '/delay-test-' + replace(tag, /[^A-Za-z0-9_.-]/g, '_') + '.json';
+}
+
+function delay_test_check_config(client_config, node, tag) {
+	let test_config = json(sprintf('%.J', client_config)),
+	    path = delay_test_tmp_path(tag),
+	    ok = false;
+
+	push_node_outbound(test_config, node, tag);
+
+	if (isEmpty(test_config.endpoints))
+		test_config.endpoints = null;
+
+	system('mkdir -p ' + shellQuote(RUN_DIR));
+	writefile(path, sprintf('%.J\n', removeBlankAttrs(test_config)));
+
+	ok = (system('/usr/bin/sing-box check --config ' + shellQuote(path) + ' >/dev/null 2>&1') === 0);
+	system('rm -f ' + shellQuote(path));
+
+	return ok;
+}
+
+function push_delay_test_node(client_config, node, tag) {
+	const reason = delay_test_skip_reason(node);
+
+	if (reason) {
+		reportError('warning',
+			sprintf('跳过节点连通性测试出站 %s：%s', (type(node) === 'object' && node['.name']) ? node['.name'] : tag, reason),
+			'该节点不会加入隐藏测速 Selector；请修正节点配置后再测试');
+		return false;
+	}
+
+	if (!delay_test_check_config(client_config, node, tag)) {
+		reportError('warning',
+			sprintf('跳过节点连通性测试出站 %s：sing-box check 未通过', (type(node) === 'object' && node['.name']) ? node['.name'] : tag),
+			'该节点不会加入隐藏测速 Selector；请修正节点配置后再测试');
+		return false;
+	}
+
+	push_node_outbound(client_config, node, tag);
+	return has_outbound_tag(client_config, tag);
+}
+
 function push_delay_test_selector(client_config) {
 	let nodes = [];
 
@@ -497,7 +561,7 @@ function push_delay_test_selector(client_config) {
 		const tag = 'cfg-' + cfg['.name'] + '-out';
 
 		if (!has_outbound_tag(client_config, tag))
-			push_node_outbound(client_config, cfg, tag);
+			push_delay_test_node(client_config, cfg, tag);
 
 		if (has_outbound_tag(client_config, tag) && !~index(nodes, tag))
 			push(nodes, tag);
@@ -519,6 +583,42 @@ function is_node_section(target) {
 	const node = uci.get_all(uciconfig, target) || {};
 
 	return node['.type'] === ucinode;
+}
+
+function append_unique_node(nodes, node_id) {
+	if (!isEmpty(node_id) && !~index(nodes, node_id))
+		push(nodes, node_id);
+}
+
+function expand_node_filter(manual_nodes, node_filter, owner) {
+	let nodes = [];
+
+	if (type(manual_nodes) === 'array')
+		for (let i in manual_nodes)
+			append_unique_node(nodes, i);
+	else
+		append_unique_node(nodes, manual_nodes);
+
+	if (isEmpty(node_filter))
+		return nodes;
+
+	let pattern;
+	try {
+		pattern = regexp(node_filter);
+	} catch(e) {
+		reportError('error',
+			sprintf('路由节点 %s 的节点正则无效：%s', owner, e.message || e),
+			'请修正节点正则，或清空该字段后重新生成配置');
+		return nodes;
+	}
+
+	uci.foreach(uciconfig, ucinode, (cfg) => {
+		const label = cfg.label || cfg['.name'];
+		if (match(label, pattern))
+			append_unique_node(nodes, cfg['.name']);
+	});
+
+	return nodes;
 }
 
 function get_routing_target_outbound(target) {
@@ -633,6 +733,68 @@ function get_ruleset(cfg) {
 	for (let i in cfg)
 		push(rules, isEmpty(i) ? null : 'cfg-' + i + '-rule');
 	return rules;
+}
+
+function rename_tags(value, rename) {
+	let t = type(value);
+
+	if (t === 'object') {
+		for (let k in value)
+			value[k] = rename_tags(value[k], rename);
+		return value;
+	}
+
+	if (t === 'array') {
+		for (let i = 0; i < length(value); i++)
+			value[i] = rename_tags(value[i], rename);
+		return value;
+	}
+
+	if (t === 'string')
+		return (value in rename) ? rename[value] : value;
+
+	return value;
+}
+
+function apply_outbound_tag_rename(client_config) {
+	let tag_map = build_outbound_tag_map(uci),
+	    rename = {};
+
+	for (let section in tag_map) {
+		let old_tag = 'cfg-' + section + '-out',
+		    final_tag = tag_map[section];
+
+		rename[old_tag] = final_tag;
+		rename[old_tag + '-shadowtls'] = final_tag + '-out-shadowtls';
+	}
+
+	rename_tags(client_config, rename);
+}
+
+function assert_unique_outbound_tags(client_config) {
+	let seen = {};
+
+	for (let outbound in (client_config.outbounds || [])) {
+		let tag = (type(outbound) === 'object') ? outbound.tag : null;
+		if (tag === null)
+			continue;
+		if (seen[tag])
+			reportError('error',
+				sprintf('rename 后出现重复 outbound tag: %s', tag),
+				'通常意味着去重算法异常；请附带节点 label / section 列表反馈');
+		seen[tag] = true;
+	}
+
+	for (let endpoint in (client_config.endpoints || [])) {
+		let tag = (type(endpoint) === 'object') ? endpoint.tag : null;
+		if (tag === null)
+			continue;
+		if (seen[tag])
+			reportError('error',
+				sprintf('rename 后出现重复 outbound tag: %s', tag),
+				'通常意味着去重算法异常；请附带节点 label / section 列表反馈');
+		seen[tag] = true;
+	}
 }
 /* Config helper end */
 
@@ -960,26 +1122,44 @@ if (!isEmpty(main_node)) {
 			return;
 
 		if (cfg.node === 'urltest') {
+			const owner = cfg.label || cfg['.name'];
+			const urltest_nodes = expand_node_filter(cfg.urltest_nodes, cfg.node_filter, owner);
+			if (!length(urltest_nodes)) {
+				reportError('error',
+					sprintf('路由节点 %s 没有可用节点', owner),
+					'请手动选择节点，或填写能命中节点名称的节点正则');
+				return;
+			}
+
 			push(config.outbounds, {
 				type: 'urltest',
 				tag: 'cfg-' + cfg['.name'] + '-out',
-				outbounds: map(cfg.urltest_nodes, (k) => `cfg-${k}-out`),
+				outbounds: map(urltest_nodes, (k) => `cfg-${k}-out`),
 				url: cfg.urltest_url,
 				interval: strToTime(cfg.urltest_interval),
 				tolerance: strToInt(cfg.urltest_tolerance),
 				idle_timeout: strToTime(cfg.urltest_idle_timeout),
 				interrupt_exist_connections: strToBool(cfg.urltest_interrupt_exist_connections)
 			});
-			group_nodes = [...group_nodes, ...filter(cfg.urltest_nodes, (l) => !~index(group_nodes, l))];
+			group_nodes = [...group_nodes, ...filter(urltest_nodes, (l) => !~index(group_nodes, l))];
 		} else if (cfg.node === 'selector') {
+			const owner = cfg.label || cfg['.name'];
+			const selector_nodes = expand_node_filter(cfg.selector_nodes, cfg.node_filter, owner);
+			if (!length(selector_nodes)) {
+				reportError('error',
+					sprintf('路由节点 %s 没有可用节点', owner),
+					'请手动选择节点，或填写能命中节点名称的节点正则');
+				return;
+			}
+
 			push(config.outbounds, {
 				type: 'selector',
 				tag: 'cfg-' + cfg['.name'] + '-out',
-				outbounds: map(cfg.selector_nodes, get_routing_target_outbound),
+				outbounds: map(selector_nodes, get_routing_target_outbound),
 				default: get_routing_target_outbound(cfg.selector_default),
 				interrupt_exist_connections: strToBool(cfg.selector_interrupt_exist_connections)
 			});
-			group_nodes = [...group_nodes, ...filter(cfg.selector_nodes, (l) => !~index(group_nodes, l))];
+			group_nodes = [...group_nodes, ...filter(selector_nodes, (l) => !~index(group_nodes, l))];
 		} else {
 			const outbound = uci.get_all(uciconfig, cfg.node) || {};
 			push_node_outbound(config, outbound, 'cfg-' + cfg.node + '-out', cfg);
@@ -1196,6 +1376,9 @@ if (strToBool(clash_api_enabled))
 if (isEmpty(config.experimental))
 	config.experimental = null;
 /* Experimental end */
+
+apply_outbound_tag_rename(config);
+assert_unique_outbound_tags(config);
 
 // Check for configuration errors. Fatal errors (e.g. routing cycles) must NOT
 // overwrite the existing sing-box-c.json with an invalid config: that would make

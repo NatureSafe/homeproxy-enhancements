@@ -4,7 +4,10 @@
 import { popen } from 'fs';
 import { cursor } from 'uci';
 
+import { build_outbound_tag_map } from '/etc/homeproxy/scripts/outbound_tag.uc';
+
 const TCPING_MAX_NODES = 300;
+const SECTION_MAX_LEN = 128;
 const DELAY_TIMEOUT = 5000;
 const FETCH_TIMEOUT = 30000;
 const DELAY_TEST_URL = 'https://www.gstatic.com/generate_204';
@@ -74,7 +77,7 @@ function parseGroupDelayResult(result) {
 
 	error = result.message || result.error || '';
 
-	for (let name in keys(result)) {
+	for (let name in result) {
 		let delay = result[name];
 
 		if (type(delay) === 'int' || type(delay) === 'double') {
@@ -84,6 +87,30 @@ function parseGroupDelayResult(result) {
 	}
 
 	return { delays, has_result, error };
+}
+
+function loadedProxyTags(hpuci) {
+	let payload = clashApiGet(hpuci, '/proxies', FETCH_TIMEOUT),
+	    tags = {};
+
+	if (type(payload) === 'object' && type(payload.proxies) === 'object')
+		for (let name in payload.proxies)
+			tags[name] = true;
+	else
+		return null;
+
+	return tags;
+}
+
+function nodeTag(tag_map, section) {
+	return tag_map[section] || ('cfg-' + section + '-out');
+}
+
+function validSectionName(section) {
+	return type(section) === 'string' &&
+	       section !== '' &&
+	       length(section) <= SECTION_MAX_LEN &&
+	       match(section, /^[A-Za-z0-9_]+$/);
 }
 
 const methods = {
@@ -98,39 +125,54 @@ const methods = {
 			let nodes = {},
 			    tested = 0,
 			    tags = [],
+			    seen_sections = {},
+			    loaded = null,
 			    warning = '';
 
 			hpuci.load('homeproxy');
+			let tag_map = build_outbound_tag_map(hpuci);
 
 			for (let i = 0; i < length(sections); i++) {
 				let section = sections[i];
+				if (!validSectionName(section))
+					return { result: false, error: 'illegal section' };
+				if (seen_sections[section])
+					continue;
+				seen_sections[section] = true;
+
 				if (++tested > TCPING_MAX_NODES)
 					nodes[section] = { status: 'skipped', error: sprintf('一次最多测试 %d 个节点', TCPING_MAX_NODES) };
 				else {
 					let cfg = hpuci.get_all('homeproxy', section);
-					if (!cfg) {
+					if (!cfg || cfg['.type'] !== 'node') {
 						nodes[section] = { status: 'missing', error: '节点不存在' };
 					} else if (cfg.type in ['direct', 'block']) {
 						nodes[section] = {
 							status: 'unsupported',
-							target: 'cfg-' + section + '-out',
+							target: nodeTag(tag_map, section),
 							error: '直连或阻断节点不测速'
 						};
 					} else {
-						push(tags, 'cfg-' + section + '-out');
+						push(tags, nodeTag(tag_map, section));
 					}
 				}
 			}
 
 			if (length(tags)) {
+				if (hpuci.get('homeproxy', 'config', 'clash_api_enabled') !== '1')
+					return { result: false, error: '请先开启 Clash API 后再进行连通性测试。' };
+
 				let parsed = parseGroupDelayResult(clashApiGet(hpuci, groupDelayPath(), groupDelayTimeout()));
+				loaded = loadedProxyTags(hpuci);
 
 				if (!parsed.has_result)
-					warning = parsed.error || '本次连通性测试未返回结果，已保留原显示。';
+					warning = parsed.error || ((loaded === null)
+						? 'Clash API 未响应，请确认 HomeProxy 客户端正在运行。'
+						: '本次连通性测试未返回结果，已保留原显示。');
 
 				for (let i = 0; i < length(sections); i++) {
 					let section = sections[i],
-					    tag = 'cfg-' + section + '-out',
+					    tag = nodeTag(tag_map, section),
 					    delay = parsed.delays[tag];
 
 					if (nodes[section])
@@ -138,6 +180,12 @@ const methods = {
 
 					if (type(delay) === 'int' || type(delay) === 'double')
 						nodes[section] = { status: 'ok', delay: int(delay), target: tag };
+					else if (type(loaded) === 'object' && !(tag in loaded))
+						nodes[section] = {
+							status: 'unloaded',
+							target: tag,
+							error: '节点未加入当前运行配置'
+						};
 					else
 						nodes[section] = {
 							status: 'unchanged',
@@ -149,10 +197,12 @@ const methods = {
 
 			for (let i = 0; i < length(sections); i++) {
 				let section = sections[i];
+				if (seen_sections[section] !== true)
+					continue;
 				if (!nodes[section])
 					nodes[section] = {
 						status: 'unchanged',
-						target: 'cfg-' + section + '-out',
+						target: nodeTag(tag_map, section),
 						error: '本次未返回结果'
 					};
 			}

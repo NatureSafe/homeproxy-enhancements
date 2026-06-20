@@ -11,11 +11,10 @@
 				"service": [ "list" ],
 				"luci.homeproxy": [
 					"connection_check",
+					"preview_node_filter",
 					"resources_get_version",
-					"singbox_get_features"
-				],
-				"luci.homeproxy_config": [
-					"config_get"
+					"singbox_get_features",
+					"validate_regex"
 				],
 				"luci.homeproxy_tcping": [
 					"nodes_tcping"

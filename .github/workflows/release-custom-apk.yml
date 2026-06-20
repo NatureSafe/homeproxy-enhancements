@@ -108,7 +108,7 @@ jobs:
           pushd .github
           CUSTOM_PKG_NAME="homeproxy-custom" \
             CUSTOM_PKG_VERSION="${HOMEPROXY_APK_VERSION}" \
-            CUSTOM_PKG_DESCRIPTION="HomeProxy 修改版，内置简体中文；支持 Surge 格式节点订阅、连通性测试、SS2022 + ShadowTLS、Selector 路由节点、路由规则直选节点、HomeProxy 配置备份 / 恢复、默认开启 Clash API、MetaCubeXD 面板入口，并隐藏 SS2022 + ShadowTLS 生成的cfg-xxx-out-shadowtls 中间层节点。" \
+            CUSTOM_PKG_DESCRIPTION="HomeProxy 修改版，内置简体中文；支持 Surge 格式节点订阅、连通性测试、SS2022 + ShadowTLS、Selector 路由节点、路由节点正则筛选节点、路由规则直选节点、运行时 outbound tag 映射为节点真实名称、HomeProxy 配置备份 / 恢复、默认开启 Clash API、MetaCubeXD 面板入口，并隐藏 SS2022 + ShadowTLS 生成的 cfg-xxx-out-shadowtls 中间层节点。" \
             APK_SIGN_KEY="../homeproxy-custom.key" \
             fakeroot bash build-ipk.sh apk "snapshot"
           popd
@@ -158,12 +158,11 @@ jobs:
 
           ### 本版本变更
 
-          - 节点页面和订阅节点页面新增“连通性测试”按钮，并在节点列表中新增“延迟”列。
-          - 通过 sing-box Clash API 对隐藏测速 Selector 执行 URL 延迟测试，支持 Hysteria2、AnyTLS、SS2022 + ShadowTLS 等已加入运行配置的节点。
-          - 生成运行配置时自动加入隐藏测速 Selector，不写入 UCI，不参与路由；MetaCubeXD 面板仅隐藏该测速组本身，组内节点仍正常显示。
-          - 测试结果按 MetaCubeXD 的组测速语义处理：默认测试 URL 为 `https://www.gstatic.com/generate_204`，单节点超时为 5000 ms，整组请求最多等待 30 秒。
-          - 本次未返回结果的节点保留原显示，避免误显示为整批失败；延迟列默认显示 `-`，明确超时才显示“超时”。
-          - 升级/安装 `homeproxy-custom` 后自动刷新 LuCI 缓存、LuCI 会话、`rpcd` 和 `uhttpd`，避免新增 ACL 后旧 Web 会话继续报权限错误。
+          - 将 HomeProxy 运行时 outbound tag 映射为节点真实名称，MetaCubeXD / Yacd / Clash API / LuCI 节点测速可直接显示可读节点名。
+          - 同名节点、保留 tag、内部 `cfg-*` 命名空间冲突时，会按 section id 字典序生成稳定后缀，避免重复 tag。
+          - ShadowTLS 链式节点会同步映射中间层 tag，且 HomeProxy 面板代理仍会隐藏 ShadowTLS 中间层节点。
+          - `luci.homeproxy_tcping` 同步使用可读 tag 进行节点测速，并增加 RPC section 入参校验。
+          - outbound tag 映射逻辑拆分到独立模块 `outbound_tag.uc`，减少对 `homeproxy.uc` 公共工具文件的侵入，便于后续跟随上游升级。
           EOF
 
       - name: Publish GitHub release
